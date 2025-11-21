@@ -17,11 +17,59 @@ from .util import (
     rc_highpass,
     rlc_lowpass,
     rlc_highpass,
+    lc_bandpass,
+    lc_bandstop,
     run_bode_sweep,
     run_bode_sweep_live,
     save_to_csv,
     progress_printer,
 )
+
+
+def parse_resistance(value: str) -> float:
+    """
+    Parse resistance value with SI prefixes (e.g., '3.3k', '0.5', '10M', '100m').
+
+    Supports: p (pico), n (nano), u/µ (micro), m (milli), k/K (kilo), M (mega), G (giga), T (tera)
+    Optional unit suffix 'Ohm' or 'Ω' is accepted and stripped.
+
+    Examples: '0.5' -> 0.5, '3.3k' -> 3300, '3.6Ohm' -> 3.6, '3.3KOhm' -> 3300, '1M' -> 1000000
+    """
+    value = value.strip()
+
+    # Strip optional 'Ohm' or 'Ω' suffix (case-insensitive)
+    import re
+    value = re.sub(r'(Ohm|Ω)$', '', value, flags=re.IGNORECASE).strip()
+
+    # Try plain float first
+    try:
+        return float(value)
+    except ValueError:
+        pass
+
+    # Parse with SI multipliers
+    match = re.match(r'^([\d.]+)\s*([pnuµmkKMGT]?)$', value)
+    if not match:
+        raise ValueError(f"Invalid resistance format: {value}")
+
+    number = float(match.group(1))
+    prefix = match.group(2)
+
+    multipliers = {
+        '': 1,
+        'p': 1e-12,
+        'n': 1e-9,
+        'u': 1e-6,
+        'µ': 1e-6,
+        'm': 1e-3,
+        'k': 1e3,
+        'K': 1e3,
+        'M': 1e6,
+        'G': 1e9,
+        'T': 1e12,
+    }
+
+    return number * multipliers.get(prefix, 1)
 
 
 def main():
@@ -120,6 +168,10 @@ Notes:
                        help='Overlay theoretical 2nd-order RLC lowpass response at resonant frequency. Format: FREQ or FREQ:RESISTANCE (e.g., 10KHz, 100KHz:3.6). RESISTANCE in Ohms accounts for inductor ESR. Can be specified multiple times')
     parser.add_argument('--rlc-highpass', type=str, action='append', metavar='FREQ[:R]',
                        help='Overlay theoretical 2nd-order RLC highpass response at resonant frequency. Format: FREQ or FREQ:RESISTANCE (e.g., 100Hz, 10KHz:3.6). RESISTANCE in Ohms accounts for inductor ESR. Can be specified multiple times')
+    parser.add_argument('--lc-bandpass', type=str, action='append', metavar='L:C:R_ESR:R_SRC',
+                       help='Overlay theoretical LC bandpass (parallel LC with voltage divider). Format: L:C:R_ESR:R_SOURCE (e.g., 1mH:10nF:0.5:3.3k). L is inductance, C is capacitance, R_ESR is inductor ESR in Ohms, R_SOURCE is source/protection resistor in Ohms. All parameters required. Can be specified multiple times')
+    parser.add_argument('--lc-bandstop', type=str, action='append', metavar='L:C:R_ESR:R_SRC',
+                       help='Overlay theoretical LC bandstop/notch (series LC shunt to ground). Format: L:C:R_ESR:R_SOURCE (e.g., 1mH:10nF:0.5:3.3k). L is inductance, C is capacitance, R_ESR is inductor ESR in Ohms, R_SOURCE is source/protection resistor in Ohms. All parameters required. Can be specified multiple times')
 
     # Advanced options
     parser.add_argument('--mem-depth', type=str, default='10K',
@@ -202,6 +254,40 @@ Notes:
             except ValueError as e:
                 parser.error(f"Invalid RLC highpass parameter '{hp}': {e}")
 
+    # Parse LC bandpass filters (format: L:C:R_ESR:R_SOURCE)
+    lc_bandpass_params = []
+    if args.lc_bandpass:
+        for bp in args.lc_bandpass:
+            try:
+                parts = bp.split(':')
+                if len(parts) != 4:
+                    raise ValueError("Format must be L:C:R_ESR:R_SOURCE (e.g., 1mH:10nF:0.5:3.3k)")
+                # Parse with SI units
+                L = parse_si(parts[0], unit='H')
+                C = parse_si(parts[1], unit='F')
+                r_esr = parse_resistance(parts[2])
+                r_source = parse_resistance(parts[3])
+                lc_bandpass_params.append((L, C, r_esr, r_source))
+            except ValueError as e:
+                parser.error(f"Invalid LC bandpass parameter '{bp}': {e}")
+
+    # Parse LC bandstop filters (format: L:C:R_ESR:R_SOURCE)
+    lc_bandstop_params = []
+    if args.lc_bandstop:
+        for bs in args.lc_bandstop:
+            try:
+                parts = bs.split(':')
+                if len(parts) != 4:
+                    raise ValueError("Format must be L:C:R_ESR:R_SOURCE (e.g., 1mH:10nF:0.5:3.3k)")
+                # Parse with SI units
+                L = parse_si(parts[0], unit='H')
+                C = parse_si(parts[1], unit='F')
+                r_esr = parse_resistance(parts[2])
+                r_source = parse_resistance(parts[3])
+                lc_bandstop_params.append((L, C, r_esr, r_source))
+            except ValueError as e:
+                parser.error(f"Invalid LC bandstop parameter '{bs}': {e}")
+
     # Build extra plot functions if requested
     extra = {}
     if rc_lowpass_freqs:
@@ -226,6 +312,26 @@ Notes:
             else:
                 label = f"RLC highpass ({format_frequency(fc)})"
             extra[label] = rlc_highpass(fc, r)
+    if lc_bandpass_params:
+        for L, C, r_esr, r_source in lc_bandpass_params:
+            # Calculate resonant frequency for the label
+            fc = 1.0 / (2 * np.pi * np.sqrt(L * C))
+            # Build label showing component values
+            # Format resistances nicely (e.g., 3300 -> 3.3k, 0.5 -> 0.5Ω)
+            r_esr_str = f"{r_esr:.1f}Ω" if r_esr < 1000 else f"{r_esr/1000:.1f}kΩ"
+            r_src_str = f"{r_source:.1f}Ω" if r_source < 1000 else f"{r_source/1000:.1f}kΩ"
+            label = f"LC bandpass (L={L*1e3:.2f}mH, C={C*1e9:.1f}nF, R_esr={r_esr_str}, R_src={r_src_str}, f₀={format_frequency(fc)})"
+            extra[label] = lc_bandpass(L, C, r_esr, r_source)
+    if lc_bandstop_params:
+        for L, C, r_esr, r_source in lc_bandstop_params:
+            # Calculate resonant frequency for the label
+            fc = 1.0 / (2 * np.pi * np.sqrt(L * C))
+            # Build label showing component values
+            # Format resistances nicely (e.g., 3300 -> 3.3k, 0.5 -> 0.5Ω)
+            r_esr_str = f"{r_esr:.1f}Ω" if r_esr < 1000 else f"{r_esr/1000:.1f}kΩ"
+            r_src_str = f"{r_source:.1f}Ω" if r_source < 1000 else f"{r_source/1000:.1f}kΩ"
+            label = f"LC bandstop (L={L*1e3:.2f}mH, C={C*1e9:.1f}nF, R_esr={r_esr_str}, R_src={r_src_str}, f₀={format_frequency(fc)})"
+            extra[label] = lc_bandstop(L, C, r_esr, r_source)
 
     # Pass None if no extra plots requested
     extra = extra if extra else None

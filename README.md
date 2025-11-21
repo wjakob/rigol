@@ -129,6 +129,15 @@ python -m bode --rc-lowpass 1KHz --rlc-lowpass 10KHz:3.6 --rc-highpass 100Hz
 
 # Compare ideal LC vs real RLC with resistance
 python -m bode --rlc-lowpass 10KHz --rlc-lowpass 10KHz:5
+
+# LC bandpass filter (parallel LC with voltage divider)
+# Format: L:C:R_ESR:R_SOURCE
+# Example: 1mH inductor, 10nF capacitor, 0.5Ω inductor ESR, 3.3kΩ protection resistor
+python -m bode --lc-bandpass 1mH:10nF:0.5:3.3k
+
+# LC bandstop (notch) filter (series LC shunt to ground)
+# Example: 1mH inductor, 10nF capacitor, 0.5Ω inductor ESR, 4.7kΩ protection resistor
+python -m bode --lc-bandstop 1mH:10nF:0.5:4.7k
 ```
 
 ### Low Voltage Measurements
@@ -177,6 +186,8 @@ python -m bode -i 2 -o 4 -a 192.168.1.100
 - `--rc-highpass FREQ` - Overlay 1st-order RC highpass response at cutoff frequency (can specify multiple times)
 - `--rlc-lowpass FREQ[:R]` - Overlay 2nd-order RLC lowpass response at resonant frequency. Optional R specifies series resistance in Ohms for inductor ESR (e.g., `100KHz:3.6`). Can be specified multiple times
 - `--rlc-highpass FREQ[:R]` - Overlay 2nd-order RLC highpass response at resonant frequency. Optional R specifies series resistance in Ohms for inductor ESR (e.g., `10KHz:3.6`). Can be specified multiple times
+- `--lc-bandpass L:C:R_ESR:R_SRC` - Overlay LC bandpass (parallel LC with voltage divider). Format: `L:C:R_ESR:R_SOURCE` where L is inductance (H), C is capacitance (F), R_ESR is inductor ESR (Ω), R_SOURCE is source/protection resistor (Ω). Example: `1mH:10nF:0.5:3.3k`. Can be specified multiple times
+- `--lc-bandstop L:C:R_ESR:R_SRC` - Overlay LC bandstop/notch (series LC shunt to ground). Format: `L:C:R_ESR:R_SOURCE` where L is inductance (H), C is capacitance (F), R_ESR is inductor ESR (Ω), R_SOURCE is source/protection resistor (Ω). Example: `1mH:10nF:0.5:4.7k`. Can be specified multiple times
 
 ### Advanced Options
 - `--mem-depth` - Memory depth (`10K`, `100K`, `1M`, `10M`) (default: `10K`)

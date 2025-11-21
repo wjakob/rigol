@@ -38,7 +38,7 @@ class FreqProbe:
         resource: str = "TCPIP0::192.168.5.2::INSTR",
         channel_a: int = 1,
         channel_b: int = 2,
-        desired_cycles: int = 1000,      # used only to choose a timebase
+        desired_cycles: int = 10,        # used only to choose a timebase
         mem_depth: str = "10K",          # "10K", "100K", "1M", "25M", ...
         max_voltage: float = 10.0,  # expected |V| at probe tip
         probe_factor: int = 10,          # 10× probe (must be integer)
@@ -222,9 +222,7 @@ class FreqProbe:
         self._write(":ACQuire:TYPE NORMal")
         self._write(":ACQuire:AVERages 1")
         self._write(f":ACQuire:MDEPth {self.mem_depth_setting}")
-        self.mem_depth_points = self._parse_points(
-            self._query(":ACQuire:MEMDepth?").strip()
-        )
+        self.mem_depth_points = self._parse_points(self.mem_depth_setting)
 
         self._write(f":TRIGger:MODE EDGE")
         self._write(f":TRIGger:EDGE:SOURce CHANnel{self.channel_a}")
@@ -232,56 +230,34 @@ class FreqProbe:
         self._write(f":TRIGger:EDGE:SLOPe POSitive")
         self._write(f":TRIGger:SWEep NORMal")
 
-        time.sleep(1)
+        self._write(":WAVeform:MODE RAW")
+        self._write(":WAVeform:FORMat WORD")
+        self._write(f":WAVeform:POINts {self.mem_depth_points}")
 
-    def _configure_timebase_for_freq(self, freq_hz: float) -> None:
+    def _wait_for_trigger_and_stop(self) -> None:
         """
-        Set timebase so that 10 divisions cover about desired_cycles/freq_hz.
+        Wait for single-shot acquisition to complete and stop.
 
-        This only affects what you see on the screen (visible window). The
-        record length is determined by mem_depth and the scope's chosen Fs,
-        so the full capture will generally contain more cycles than visible.
+        Assumes :SINGle was already called to arm the trigger.
+        Polls :TRIGger:STATus? until "TD" or "STOP", then issues :STOP
+        to freeze the waveform buffer for reading.
         """
-        target_span = self.desired_cycles / freq_hz
-        safety_factor = 1.2
-        visible_span = target_span * safety_factor
-        tscale = visible_span / 10.0
-        self._write(f":TIMebase:MAIN:SCALe {tscale}")
-
-    def _configure_afg(self, freq_hz: float) -> None:
-        """Configure the internal AFG for the given frequency."""
-        self._write(f":SOURce:FREQuency {freq_hz}")
-        time.sleep(1)
-
-    def _fresh_acquisition(self) -> None:
-        """
-        Force a fresh acquisition using RUN + TD + STOP:
-
-          1. Set EDGE trigger on channel_a.
-          2. Set trigger sweep to NORMal.
-          3. :RUN
-          4. Poll :TRIGger:STATus? until "TD" (trigger detected).
-          5. :STOP
-
-        This ensures each measure() gets a new record.
-        """
-
-        # Start continuous acquisition
-        self._write(":RUN")
-
-        # Wait for at least one trigger detection
+        # Wait for trigger to be detected
+        # In single-shot mode, status goes: WAIT -> TD -> STOP
+        # We check for TD to know when waveform is being captured
         t0 = time.time()
         while True:
             status = self._query(":TRIGger:STATus?").strip().upper()
-            if status == "TD":  # trigger detected
+            if status == "TD" or status == "STOP":  # Trigger detected or already stopped
                 break
             if time.time() - t0 > 5.0:
                 raise TimeoutError(
-                    f"Acquisition did not reach TD within 5 s; last status={status!r}"
+                    f"Acquisition did not trigger within 5 s; last status={status!r}"
                 )
             time.sleep(0.01)
 
-        # Freeze the record so RAW read is allowed and stable
+        # Explicitly stop to freeze waveform buffer for reading
+        # This is needed even in single-shot mode to ensure RAW data is accessible
         self._write(":STOP")
 
     # ------------------- waveform I/O -------------------
@@ -304,24 +280,47 @@ class FreqProbe:
         Returns (v, meta), where v is in volts and meta contains xincr, etc.
         We do NOT transfer a time array; dt = xincr is all you need for
         regular sampling.
+
+        Parameters
+        ----------
+        channel : int
+            Channel number to read
         """
-        self._write(f":WAVeform:SOURce CHANnel{channel}")
-        self._write(":WAVeform:MODE RAW")
-        self._write(":WAVeform:FORMat WORD")
-        self._write(f":WAVeform:POINts {self.mem_depth_points}")
+        # Batch source selection with preamble query
+        # Use :WAVeform:PREamble? instead of 6 separate queries
+        # Preamble format: format,type,points,count,xincr,xorig,xref,yincr,yorig,yref
+        preamble = self._query(f":WAVeform:SOURce CHANnel{channel};:WAVeform:PREamble?").strip()
+        parts = preamble.split(',')
 
-        xincr = float(self._query(":WAVeform:XINCrement?"))
-        xorig = float(self._query(":WAVeform:XORigin?"))
-        xref  = float(self._query(":WAVeform:XREFerence?"))
-        yincr = float(self._query(":WAVeform:YINCrement?"))
-        yorig = float(self._query(":WAVeform:YORigin?"))
-        yref  = float(self._query(":WAVeform:YREFerence?"))
+        if len(parts) < 10:
+            raise ValueError(f"Unexpected preamble format: {preamble}")
 
-        self._write(":WAVeform:DATA?")
+        # Parse preamble fields
+        # format: 0=BYTE, 1=WORD, 2=ASCii
+        # type: 0=NORMal, 1=PEAK, 2=AVERage
+        xincr = float(parts[4])
+        xorig = float(parts[5])
+        xref = float(parts[6])
+        yincr = float(parts[7])
+        yorig = float(parts[8])
+        yref = float(parts[9])
+
+        # Batch source selection with data request
+        self._write(f":WAVeform:SOURce CHANnel{channel};:WAVeform:DATA?")
         raw_block = self.inst.read_raw()
         data_bytes = self._parse_tmc_block(raw_block)
 
         codes = np.frombuffer(data_bytes, dtype="<u2")
+
+        # Check that we got data
+        if codes.size == 0:
+            raise ValueError(
+                f"No waveform data received for channel {channel}. "
+                f"Raw block size: {len(raw_block)} bytes, "
+                f"Data bytes: {len(data_bytes)} bytes. "
+                f"Make sure acquisition completed before reading waveform."
+            )
+
         volts = (codes.astype(np.float64) - (yorig + yref)) * yincr
 
         meta = {
@@ -352,12 +351,17 @@ class FreqProbe:
         if freq_hz <= 0:
             raise ValueError("freq_hz must be > 0")
 
-        # Configure for this frequency
-        self._configure_timebase_for_freq(freq_hz)
-        self._configure_afg(freq_hz)
+        # Batch configure and trigger acquisition
+        target_span = self.desired_cycles / freq_hz
+        safety_factor = 1.2
+        visible_span = target_span * safety_factor
+        tscale = visible_span / 10.0
 
-        # Force a fresh acquisition
-        self._fresh_acquisition()
+        # Batch: timebase + frequency + trigger setup + arm
+        self._write(f":TIMebase:MAIN:SCALe {tscale};:SOURce:FREQuency {freq_hz};:TRIGger:SWEep SINGle;:SINGle")
+
+        # Wait for trigger and stop
+        self._wait_for_trigger_and_stop()
 
         # Read both channels from the same acquisition
         v_a, meta_a = self._read_waveform(self.channel_a)
@@ -382,9 +386,9 @@ class FreqProbe:
         Measure with dynamic range adjustment for the output channel (channel_b).
 
         This method automatically adjusts the output channel voltage scale to optimize
-        signal quality by analyzing the fitted sine wave amplitude:
-        - Zooms in if signal amplitude < 25% of scale (improves SNR)
-        - Zooms out if signal amplitude exceeds the headroom threshold (prevents clipping)
+        signal quality by analyzing the actual voltage samples:
+        - Zooms out if >1% of samples exceed the headroom threshold (prevents clipping)
+        - Zooms in if peak voltage < 25% of scale (improves SNR)
 
         Hysteresis prevents oscillation: with 2× scaling, 25% threshold ensures a stable
         zone exists between zoom-in and zoom-out thresholds.
@@ -408,10 +412,6 @@ class FreqProbe:
         dt : float
             Sample interval in seconds
         """
-        from .util import fit_sine_at_freq
-
-        headroom_frac = self.headroom - 1.0  # e.g., 0.2 for 20% headroom
-
         # Set output channel to current scale (persistent across measurements)
         self.set_voltage_scale(channel=self.channel_b, value=self.current_scale)
 
@@ -419,33 +419,30 @@ class FreqProbe:
         for _ in range(max_scale_adjustments):
             v_a, v_b, dt = self.measure(freq_hz=freq_hz)
 
-            # Fit sine wave to get accurate amplitude (robust to noise)
-            Aout, _ = fit_sine_at_freq(v_b, freq_hz, dt)
+            # Voltage range is ±current_scale (8 divisions × scale/4 V/div = ±4 × scale/4 = ±scale)
+            # E.g., scale=10V means we send SCALe 2.5V/div, giving range ±10V
+            max_allowed = self.current_scale / self.headroom
+            peak_voltage = np.max(np.abs(v_b))
 
-            # Calculate thresholds with hysteresis to prevent oscillation
-            # Use 25% for zoom-in threshold to ensure separation from zoom-out threshold
-            # after 2× scale change: 0.25 * 2 = 0.5 < 0.8 (upper threshold)
-            lower_threshold = 0.25 * self.current_scale   # Zoom in if using <25% of scale
-            upper_threshold = (1.0 - headroom_frac) * self.current_scale  # Zoom out if exceeding headroom
-
-            # Zoom in if signal is too small relative to scale
-            if Aout < lower_threshold and self.current_scale > 0.001:  # 1mV minimum
-                new_scale = self.current_scale / 2.0
-                if not self.quiet:
-                    print(f'  CH{self.channel_b}: Amplitude {Aout:.3f}V < {lower_threshold:.3f}V, zooming in to {new_scale:.3f}V')
-                self.current_scale = new_scale
-                self.set_voltage_scale(channel=self.channel_b, value=self.current_scale)
-                # re-measure with finer scale
-            # Zoom out if signal is too large (approaching clipping)
-            elif Aout > upper_threshold and self.current_scale < self.max_voltage:
+            # Zoom out if >1% of samples exceed headroom
+            pct_exceeding = 100.0 * np.sum(np.abs(v_b) > max_allowed) / len(v_b)
+            if pct_exceeding > 1.0 and self.current_scale < self.max_voltage:
                 new_scale = min(self.current_scale * 2.0, self.max_voltage)
                 if not self.quiet:
-                    print(f'  CH{self.channel_b}: Amplitude {Aout:.3f}V > {upper_threshold:.3f}V, zooming out to {new_scale:.3f}V')
+                    print(f'  CH{self.channel_b}: {pct_exceeding:.1f}% samples exceed headroom, zooming out to {new_scale:.3f}V')
                 self.current_scale = new_scale
                 self.set_voltage_scale(channel=self.channel_b, value=self.current_scale)
-                # re-measure with adjusted scale
+
+            # Zoom in if peak < 25% of range
+            elif peak_voltage < 0.25 * self.current_scale and self.current_scale > 0.001:
+                new_scale = self.current_scale / 2.0
+                if not self.quiet:
+                    print(f'  CH{self.channel_b}: Peak {peak_voltage:.3f}V < 25% of scale, zooming in to {new_scale:.3f}V')
+                self.current_scale = new_scale
+                self.set_voltage_scale(channel=self.channel_b, value=self.current_scale)
+
             else:
-                # Scale is fine for this frequency
+                # Scale is good
                 break
 
         return v_a, v_b, dt

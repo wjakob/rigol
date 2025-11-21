@@ -82,6 +82,9 @@ def parse_si(value: str, unit: str = 'Hz') -> float:
     Parse a string with SI prefixes into a numeric value.
 
     Supports standard SI prefixes with case sensitivity:
+    - p = pico (10^-12)
+    - n = nano (10^-9)
+    - u/µ = micro (10^-6)
     - m = milli (10^-3)
     - k/K = kilo (10^3)
     - M = mega (10^6)
@@ -91,9 +94,9 @@ def parse_si(value: str, unit: str = 'Hz') -> float:
     Parameters
     ----------
     value : str
-        String to parse, e.g., '10KHz', '5V', '10mV', '1.5MHz'
+        String to parse, e.g., '10KHz', '5V', '10mV', '1.5MHz', '10nF'
     unit : str, optional
-        Expected unit ('Hz', 'V', etc.). Default is 'Hz'.
+        Expected unit ('Hz', 'V', 'H', 'F', etc.). Default is 'Hz'.
         Used to validate the input.
 
     Returns
@@ -109,6 +112,10 @@ def parse_si(value: str, unit: str = 'Hz') -> float:
     1500000.0
     >>> parse_si('10mV', unit='V')
     0.01
+    >>> parse_si('10nF', unit='F')
+    1e-08
+    >>> parse_si('1mH', unit='H')
+    0.001
     >>> parse_si('5V', unit='V')
     5.0
     >>> parse_si('10K', unit='Hz')  # Unit suffix optional
@@ -121,7 +128,7 @@ def parse_si(value: str, unit: str = 'Hz') -> float:
 
     # Match number (with optional decimal) followed by optional SI prefix and unit
     # Case-sensitive for prefix to distinguish m (milli) from M (mega)
-    match = re.match(r'^([\d.]+)\s*([mkKMGT]?)([a-zA-Z]+)?$', value)
+    match = re.match(r'^([\d.]+)\s*([pnuµmkKMGT]?)([a-zA-Z]+)?$', value)
     if not match:
         raise ValueError(f"Invalid format: {original_value}")
 
@@ -136,6 +143,10 @@ def parse_si(value: str, unit: str = 'Hz') -> float:
     # SI prefix multipliers (case-sensitive)
     multipliers = {
         '': 1,
+        'p': 1e-12,  # pico
+        'n': 1e-9,   # nano
+        'u': 1e-6,   # micro (ASCII)
+        'µ': 1e-6,   # micro (Unicode)
         'm': 1e-3,   # milli
         'k': 1e3,    # kilo (lowercase)
         'K': 1e3,    # kilo (uppercase)
@@ -407,6 +418,131 @@ def rlc_highpass(fc: float, r: float = 0.0):
     return func
 
 
+def lc_bandpass(L: float, C: float, r_esr: float = 0.0, r_source: float = 50.0):
+    """
+    Create a callable for a 2nd-order LC bandpass filter.
+
+    Parameters
+    ----------
+    L : float
+        Inductance in Henries (e.g., 1e-3 for 1mH)
+    C : float
+        Capacitance in Farads (e.g., 10e-9 for 10nF)
+    r_esr : float
+        Inductor ESR (equivalent series resistance) in Ohms (default: 0.0 for ideal inductor)
+    r_source : float
+        Source resistance in Ohms (default: 50.0)
+
+    Returns
+    -------
+    callable
+        Function that takes frequency array and returns (gain_db, phase_deg)
+
+    Notes
+    -----
+    Models a voltage divider topology:
+        AFG -> R_source -> [L(R_esr) || C] -> GND
+               ^            ^
+               CH1          CH2
+
+    Where the parallel LC (with inductor ESR) acts as the lower leg of the divider.
+    Transfer function: H(jω) = Z_LC / (R_source + Z_LC)
+
+    At resonance (f₀ = 1/(2π√LC)): Z_LC is maximum → gain approaches 0 dB (signal passes)
+    Away from resonance: Z_LC is small → gain drops (signal blocked)
+
+    The quality factor Q = Z₀/R_esr (where Z₀ = √(L/C)) determines the bandwidth:
+    - High Q (low R_esr): narrow bandwidth, sharp peak
+    - Low Q (high R_esr): wide bandwidth, broad peak
+    """
+    def func(f: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        omega = 2 * np.pi * f
+
+        # Calculate impedances
+        # Z_L = R_esr + jωL
+        # Z_C = 1/(jωC) = -j/(ωC)
+        Z_L = r_esr + 1j * omega * L
+        Z_C = -1j / (omega * C)
+
+        # Parallel combination: Z_LC = (Z_L × Z_C) / (Z_L + Z_C)
+        Z_LC = (Z_L * Z_C) / (Z_L + Z_C)
+
+        # Voltage divider: H = Z_LC / (R_source + Z_LC)
+        H = Z_LC / (r_source + Z_LC)
+
+        # Extract magnitude and phase
+        gain = np.abs(H)
+        gain_db = 20 * np.log10(gain)
+        phase_deg = np.degrees(np.angle(H))
+
+        return gain_db, phase_deg
+    return func
+
+
+def lc_bandstop(L: float, C: float, r_esr: float = 0.0, r_source: float = 50.0):
+    """
+    Create a callable for a 2nd-order LC bandstop (notch) filter.
+
+    Parameters
+    ----------
+    L : float
+        Inductance in Henries (e.g., 1e-3 for 1mH)
+    C : float
+        Capacitance in Farads (e.g., 10e-9 for 10nF)
+    r_esr : float
+        Inductor ESR (equivalent series resistance) in Ohms (default: 0.0 for ideal inductor)
+    r_source : float
+        Source resistance in Ohms (default: 50.0)
+
+    Returns
+    -------
+    callable
+        Function that takes frequency array and returns (gain_db, phase_deg)
+
+    Notes
+    -----
+    Models a bandstop/notch filter with series LC shunt to ground:
+        AFG -> R_source -> output
+               ^           ^
+               CH1         CH2
+                           |
+                         L-C (series, with L having R_esr)
+                           |
+                          GND
+
+    At resonance (f₀ = 1/(2π√LC)): Series LC has minimum impedance (≈R_esr) → shorts output to ground → deep notch
+    Away from resonance: Series LC has high impedance → output not loaded → signal passes (0 dB)
+
+    Transfer function: H(jω) = Z_LC / (R_source + Z_LC)
+    where Z_LC = R_esr + jωL + 1/(jωC) is the series LC impedance
+
+    The quality factor Q = ω₀L/R_esr determines notch characteristics:
+    - High Q (low R_esr): deep, narrow notch
+    - Low Q (high R_esr): shallow, wide notch
+    """
+    def func(f: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        omega = 2 * np.pi * f
+
+        # Series LC impedance: Z_LC = R_esr + jωL + 1/(jωC)
+        # = R_esr + j(ωL - 1/(ωC))
+        X_L = omega * L
+        X_C = 1.0 / (omega * C)
+        Z_LC = r_esr + 1j * (X_L - X_C)
+
+        # Voltage divider: H = Z_LC / (R_source + Z_LC)
+        H = Z_LC / (r_source + Z_LC)
+
+        # Extract magnitude and phase
+        gain = np.abs(H)
+        # Avoid log(0) at exact resonance for ideal LC
+        gain = np.maximum(gain, 1e-10)
+        gain_db = 20 * np.log10(gain)
+        phase_deg = np.degrees(np.angle(H))
+
+        return gain_db, phase_deg
+    return func
+
+
 def run_bode_sweep(probe, freqs: np.ndarray,
                   progress_callback=None, quiet: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
@@ -503,18 +639,9 @@ def plot_bode_interactive(freqs: np.ndarray, gain_db: np.ndarray, phase_deg: np.
         f_ref = np.logspace(np.log10(freqs.min()), np.log10(freqs.max()), 400) if len(freqs) > 0 else freqs
 
         for label, func in extra.items():
-            # Special styling for Rigol reference data (hard-coded)
-            # Sample at measurement frequencies, not dense reference array
-            if "Rigol" in label:
-                gain_db_ref, phase_deg_ref = func(freqs)
-                ax_mag.semilogx(freqs, gain_db_ref, color='red', marker='o',
-                               linestyle='-', label=label, markersize=4, linewidth=1, zorder=1)
-                ax_phase.semilogx(freqs, phase_deg_ref, color='red', marker='o',
-                                 linestyle='-', markersize=4, linewidth=1, zorder=1)
-            else:
-                gain_db_ref, phase_deg_ref = func(f_ref)
-                ax_mag.semilogx(f_ref, gain_db_ref, linestyle='--', label=label, alpha=0.7)
-                ax_phase.semilogx(f_ref, phase_deg_ref, linestyle='--', alpha=0.7)
+            gain_db_ref, phase_deg_ref = func(f_ref)
+            ax_mag.semilogx(f_ref, gain_db_ref, linestyle='--', label=label, alpha=0.7)
+            ax_phase.semilogx(f_ref, phase_deg_ref, linestyle='--', alpha=0.7)
 
     # Configure axes
     ax_mag.set_ylabel("Gain [dB]")
