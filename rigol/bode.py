@@ -1,14 +1,36 @@
-#!/usr/bin/env python3
 """
-Command-line interface for Bode plot measurements.
+BodePlot: Unified class for Bode plot measurements with Rigol DHO924S.
+
+Combines scope configuration, measurement sweeps, and data management.
+Supports flexible callbacks for progress reporting and live plotting.
+
+Usage:
+    bode = BodePlot(
+        ip='192.168.5.2',
+        input_ch=1,
+        output_ch=2,
+        afg_voltage=10.0,
+        max_voltage=12.0,
+        probe_factor=10,
+        headroom=1.2,
+    )
+
+    # Run sweep with custom callback
+    freqs = np.logspace(np.log10(1e3), np.log10(10e6), 30)
+    bode.sweep(freqs, on_measurement=lambda **kw: print(f"{kw['freq_hz']:.0f} Hz"))
+
+    # Save results
+    bode.save_csv('results.csv')
+
+    # Cleanup
+    bode.close()
 """
 
+from typing import Tuple, Optional, Callable
 import argparse
-import os
-
 import numpy as np
 
-from .probe import FreqProbe
+from .scope import Scope
 from .util import (
     format_frequency,
     parse_si,
@@ -19,21 +41,294 @@ from .util import (
     rlc_highpass,
     lc_bandpass,
     lc_bandstop,
-    run_bode_sweep,
-    run_bode_sweep_live,
-    save_to_csv,
-    progress_printer,
+    create_print_callback,
+    LivePlotUpdater,
 )
+
+
+class BodePlot:
+    """
+    Unified Bode plot measurement class.
+
+    Manages scope configuration, frequency sweeps, amplitude/phase extraction,
+    and data export. Uses callbacks for flexible progress reporting and plotting.
+    """
+
+    def __init__(
+        self,
+        ip: str = '192.168.5.2',
+        input_ch: int = 1,
+        output_ch: int = 2,
+        desired_cycles: int = 10,
+        mem_depth: str = '10K',
+        max_voltage: float = 10.0,
+        probe_factor: int = 10,
+        afg_voltage: float = 10.0,
+        headroom: float = 1.2,
+        debug_level: int = 0,
+        quiet: bool = False,
+    ):
+        """
+        Initialize BodePlot measurement system.
+
+        Parameters
+        ----------
+        ip : str
+            Oscilloscope IP address
+        input_ch : int
+            Input channel number (1-4)
+        output_ch : int
+            Output channel number (1-4)
+        desired_cycles : int
+            Number of signal cycles to display on screen
+        mem_depth : str
+            Memory depth ('1K', '10K', '100K', '1M', '10M', '25M', '50M')
+        max_voltage : float
+            Channel voltage range (includes headroom)
+        probe_factor : int
+            Probe attenuation factor (e.g., 10 for 10x probe)
+        afg_voltage : float
+            AFG output signal amplitude in volts
+        headroom : float
+            Headroom factor for dynamic range (must be >= 1.0)
+        debug_level : int
+            Debug verbosity level (0=off, 1=print commands, 2=print and check errors)
+        quiet : bool
+            If True, suppress informational messages
+        """
+        if headroom < 1.0:
+            raise ValueError(f"headroom must be >= 1.0, got {headroom}")
+
+        self.desired_cycles = desired_cycles
+        self.headroom = headroom
+        self.quiet = quiet
+
+        # Create scope instance
+        self.scope = Scope(ip=ip, debug_level=debug_level)
+        self.scope.stop()
+
+        # Store channel references
+        self.input_ch = self.scope.channels[input_ch - 1]
+        self.output_ch = self.scope.channels[output_ch - 1]
+
+        # Configure AFG
+        self.scope.afg.function = 'SINusoid'
+        self.scope.afg.frequency = 1000.0  # Default 1kHz (will be set to actual value during sweep)
+        self.scope.afg.voltage = afg_voltage
+        self.scope.afg.offset = 0.0
+        self.scope.afg.enabled = True
+
+        # Configure input channel
+        self.input_ch.enabled = True
+        self.input_ch.coupling = 'DC'
+        self.input_ch.probe = probe_factor
+        self.input_ch.bwlimit = '20M'
+        self.input_ch.offset = 0.0
+        self.input_ch.vmax = max_voltage
+
+        # Configure output channel
+        self.output_ch.enabled = True
+        self.output_ch.coupling = 'DC'
+        self.output_ch.probe = probe_factor
+        self.output_ch.bwlimit = '20M'
+        self.output_ch.offset = 0.0
+        self.output_ch.vmax = max_voltage
+
+        # Disable other channels
+        for i in range(4):
+            if i != input_ch - 1 and i != output_ch - 1:
+                self.scope.channels[i].enabled = False
+
+        # Configure acquisition
+        self.scope.mem_depth = mem_depth
+        self.scope.acq_type = 'NORMal'
+        self.scope.acq_averages = 1
+        self.scope.tmode = 'MAIN'
+
+        # Configure trigger
+        self.scope.trigger.mode = 'EDGE'
+        self.scope.trigger.source = self.input_ch
+        self.scope.trigger.level = 0.0
+        self.scope.trigger.slope = 'POSitive'
+        self.scope.trigger.sweep = 'SINGle'
+
+        # Store last sweep results
+        self.freqs: Optional[np.ndarray] = None
+        self.gain_db: Optional[np.ndarray] = None
+        self.phase_deg: Optional[np.ndarray] = None
+
+        if not quiet:
+            print(f"BodePlot initialized: CH{input_ch} (input), CH{output_ch} (output)")
+
+    def sweep(
+        self,
+        freqs: np.ndarray,
+        on_measurement: Optional[Callable] = None,
+        max_scale_adjustments: int = 6,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Perform frequency sweep and measure gain/phase at each point.
+
+        Parameters
+        ----------
+        freqs : np.ndarray
+            Array of frequencies to measure (in Hz)
+        on_measurement : callable, optional
+            Callback function called after each measurement with kwargs:
+                - freq_hz: float - measured frequency
+                - gain_db: float - gain in dB
+                - phase_deg: float - phase in degrees
+                - gain_linear: float - linear gain
+                - index: int - current measurement index (0-based)
+                - total: int - total number of frequencies
+        max_scale_adjustments : int
+            Maximum iterations for adaptive voltage scaling
+
+        Returns
+        -------
+        freqs : np.ndarray
+            Frequency points measured
+        gain_db : np.ndarray
+            Gain in dB at each frequency
+        phase_deg : np.ndarray
+            Phase in degrees at each frequency (unwrapped)
+        """
+        gains = np.zeros_like(freqs)
+        phases = np.zeros_like(freqs)
+
+        for i, freq_hz in enumerate(freqs):
+            # Configure frequency and timebase
+            target_span = self.desired_cycles / freq_hz
+            safety_factor = 1.2
+            visible_span = target_span * safety_factor
+            tscale = visible_span / 10.0
+
+            self.scope.afg.frequency = freq_hz
+            self.scope.tdiv = tscale
+
+            self.scope.single()
+            v_out, dt = self.output_ch.waveform(
+                dt=True,
+                adaptive=True,
+                headroom=self.headroom,
+                max_iterations=max_scale_adjustments
+            )
+
+            # Read input from the same final acquisition (non-adaptive)
+            v_in = self.input_ch.waveform()
+
+            # Extract amplitude and phase using sine fitting
+            A_in, phi_in = self._fit_sine_at_freq(v_in, freq_hz, dt)
+            A_out, phi_out = self._fit_sine_at_freq(v_out, freq_hz, dt)
+
+            # Store gain and phase
+            gain = A_out / A_in
+            phase = phi_out - phi_in  # radians
+            gains[i] = gain
+            phases[i] = phase
+
+            # Invoke callback if provided
+            if on_measurement:
+                gain_db_current = 20 * np.log10(gain)
+                phase_deg_current = self._wrap_phase(np.degrees(phase))
+                gain_linear = gain
+
+                on_measurement(
+                    freq_hz=freq_hz,
+                    gain_db=gain_db_current,
+                    phase_deg=phase_deg_current,
+                    gain_linear=gain_linear,
+                    index=i,
+                    total=len(freqs),
+                )
+
+        # Convert to dB and unwrap phase
+        self.freqs = freqs
+        self.gain_db = 20 * np.log10(gains)
+        self.phase_deg = np.degrees(np.unwrap(phases))
+
+        return self.freqs, self.gain_db, self.phase_deg
+
+    def save_csv(self, filename: str) -> None:
+        """
+        Save last sweep results to CSV file.
+
+        Parameters
+        ----------
+        filename : str
+            Output CSV filename
+
+        Raises
+        ------
+        RuntimeError
+            If no sweep has been performed yet
+        """
+        if self.freqs is None or self.gain_db is None or self.phase_deg is None:
+            raise RuntimeError("No sweep results to save. Run sweep() first.")
+
+        import csv
+
+        with open(filename, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Frequency (Hz)', 'Gain (dB)', 'Phase (deg)'])
+            for freq, gain, phase in zip(self.freqs, self.gain_db, self.phase_deg):
+                writer.writerow([freq, gain, phase])
+
+    def close(self) -> None:
+        """Disable AFG and return scope to RUN mode."""
+        self.scope.afg.enabled = False
+        self.scope.run()
+
+    def _fit_sine_at_freq(
+        self,
+        sig: np.ndarray,
+        freq: float,
+        dt: float
+    ) -> Tuple[float, float]:
+        """
+        Fit a sine wave at known frequency to the signal using least squares.
+
+        Parameters
+        ----------
+        sig : np.ndarray
+            1D array of voltage samples
+        freq : float
+            Excitation frequency in Hz
+        dt : float
+            Sample interval in seconds
+
+        Returns
+        -------
+        amplitude : float
+            Fitted sine wave amplitude
+        phase : float
+            Fitted sine wave phase in radians (relative to sine)
+        """
+        N = len(sig)
+        t = np.arange(N) * dt
+        w = 2 * np.pi * freq
+
+        # Fit: sig ≈ a*cos(wt) + b*sin(wt)
+        A = np.column_stack([np.cos(w * t), np.sin(w * t)])
+        coeffs, *_ = np.linalg.lstsq(A, sig, rcond=None)
+        a, b = coeffs
+
+        amplitude = np.hypot(a, b)  # sqrt(a^2 + b^2)
+        phase = np.arctan2(a, b)    # radians
+
+        return amplitude, phase
+
+    @staticmethod
+    def _wrap_phase(deg: float) -> float:
+        """
+        Wrap phase to (-180, 180] for display friendliness (avoids 0..360 jumps).
+        """
+        return ((deg + 180.0) % 360.0) - 180.0
 
 
 def parse_resistance(value: str) -> float:
     """
     Parse resistance value with SI prefixes (e.g., '3.3k', '0.5', '10M', '100m').
-
-    Supports: p (pico), n (nano), u/µ (micro), m (milli), k/K (kilo), M (mega), G (giga), T (tera)
-    Optional unit suffix 'Ohm' or 'Ω' is accepted and stripped.
-
-    Examples: '0.5' -> 0.5, '3.3k' -> 3300, '3.6Ohm' -> 3.6, '3.3KOhm' -> 3300, '1M' -> 1000000
     """
     value = value.strip()
 
@@ -184,6 +479,8 @@ Notes:
                        help='Safety margin above signal voltage to prevent clipping. 1.2 = 20%% headroom. Must be >= 1.0 (default: 1.2)')
     parser.add_argument('--terminated', action='store_true',
                        help='Specify if 50Ω terminators are physically connected to oscilloscope channels. Termination creates a voltage divider that halves signal amplitude; this flag adjusts channel sensitivity to compensate')
+    parser.add_argument('--debug', type=int, default=0, choices=[0, 1, 2],
+                       help='Debug level: 0=off, 1=print SCPI commands, 2=print commands and check errors after each')
 
     args = parser.parse_args()
 
@@ -317,7 +614,6 @@ Notes:
             # Calculate resonant frequency for the label
             fc = 1.0 / (2 * np.pi * np.sqrt(L * C))
             # Build label showing component values
-            # Format resistances nicely (e.g., 3300 -> 3.3k, 0.5 -> 0.5Ω)
             r_esr_str = f"{r_esr:.1f}Ω" if r_esr < 1000 else f"{r_esr/1000:.1f}kΩ"
             r_src_str = f"{r_source:.1f}Ω" if r_source < 1000 else f"{r_source/1000:.1f}kΩ"
             label = f"LC bandpass (L={L*1e3:.2f}mH, C={C*1e9:.1f}nF, R_esr={r_esr_str}, R_src={r_src_str}, f₀={format_frequency(fc)})"
@@ -326,8 +622,6 @@ Notes:
         for L, C, r_esr, r_source in lc_bandstop_params:
             # Calculate resonant frequency for the label
             fc = 1.0 / (2 * np.pi * np.sqrt(L * C))
-            # Build label showing component values
-            # Format resistances nicely (e.g., 3300 -> 3.3k, 0.5 -> 0.5Ω)
             r_esr_str = f"{r_esr:.1f}Ω" if r_esr < 1000 else f"{r_esr/1000:.1f}kΩ"
             r_src_str = f"{r_source:.1f}Ω" if r_source < 1000 else f"{r_source/1000:.1f}kΩ"
             label = f"LC bandstop (L={L*1e3:.2f}mH, C={C*1e9:.1f}nF, R_esr={r_esr_str}, R_src={r_src_str}, f₀={format_frequency(fc)})"
@@ -336,19 +630,12 @@ Notes:
     # Pass None if no extra plots requested
     extra = extra if extra else None
 
-    # Build resource string
-    resource = f"TCPIP0::{args.addr}::INSTR"
-
-    # Configure voltage: AFG gets base voltage, channels get headroom
-    # AFG amplitude is peak-to-peak voltage (e.g., 10V amplitude = ±5V peak)
-    # Channel ranges must handle the peak voltage with headroom
-    # If terminated (50Ω), voltage divider halves the signal at the channel
     afg_voltage = voltage_v
     peak_voltage = voltage_v / 2.0  # Convert amplitude to peak voltage
     termination_factor = 0.5 if args.terminated else 1.0
     input_max_voltage = peak_voltage * termination_factor * args.headroom
+    mem_depth_str = args.mem_depth
 
-    # Calculate frequencies based on steps or steps-per-decade
     if args.steps_per_decade:
         freqs = generate_frequencies_per_decade(start_hz, end_hz, args.steps_per_decade)
         if not args.quiet:
@@ -364,47 +651,45 @@ Notes:
         print(f"AFG voltage: {afg_voltage:.3f} V, Channel range: {input_max_voltage:.3f} V")
         print(f"Channels: Input=CH{args.input}, Output=CH{args.output}")
 
-    # Create probe instance
-    probe = FreqProbe(
-        resource=resource,
-        channel_a=args.input,
-        channel_b=args.output,
+    bode = BodePlot(
+        ip=args.addr,
+        input_ch=args.input,
+        output_ch=args.output,
         desired_cycles=args.cycles,
-        mem_depth=args.mem_depth,
+        mem_depth=mem_depth_str,
         max_voltage=input_max_voltage,
         probe_factor=args.probe_factor,
-        afg_amplitude_v=afg_voltage,
+        afg_voltage=afg_voltage,
         headroom=args.headroom,
+        debug_level=args.debug,
         quiet=args.quiet,
     )
 
-    fig_to_show = None
+    plotter = None
     try:
         if args.headless:
-            # Headless mode: run sweep with progress reporting
             if not args.quiet:
                 print("Running sweep in headless mode...")
                 print(f"{'Frequency':>13}  {'Gain':>21}  {'Phase':>8}")
                 print(f"{'-'*13}  {'-'*21}  {'-'*8}")
-            freqs, gain_db, phase_deg = run_bode_sweep(
-                probe, freqs,
-                progress_callback=None if args.quiet else progress_printer,
-                quiet=args.quiet
-            )
+            callback = create_print_callback(quiet=args.quiet)
         else:
-            # Interactive mode with live plotting
             if not args.quiet:
                 print("Running sweep with live plotting...")
                 print(f"{'Frequency':>13}  {'Gain':>21}  {'Phase':>8}")
                 print(f"{'-'*13}  {'-'*21}  {'-'*8}")
-            freqs, gain_db, phase_deg, fig_to_show = run_bode_sweep_live(
-                probe, freqs,
-                extra=extra,
-                quiet=args.quiet
-            )
+            plotter = LivePlotUpdater(freqs, extra=extra)
+            print_cb = create_print_callback(quiet=args.quiet)
+
+            def callback(**kwargs):
+                if print_cb:
+                    print_cb(**kwargs)
+                plotter.update(**kwargs)
+
+        freqs, gain_db, phase_deg = bode.sweep(freqs, on_measurement=callback)
 
         if args.dump:
-            save_to_csv(args.dump, freqs, gain_db, phase_deg)
+            bode.save_csv(args.dump)
             if not args.quiet:
                 print(f"Data saved to {args.dump}")
 
@@ -412,16 +697,14 @@ Notes:
             print("Measurement complete!")
 
     finally:
-        # Close probe and return scope to normal operation
-        probe.close()
+        bode.close()
         if not args.quiet:
             print("Disconnected from oscilloscope.")
 
-    # Show plot after probe is closed (interactive mode only)
-    if fig_to_show is not None:
-        import matplotlib.pyplot as plt
-        plt.show()
+    if plotter is not None:
+        plotter.show()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
+    # Allow `python -m rigol.bode` as a convenience alias for the CLI
     main()

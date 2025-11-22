@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rigol-bode"
+version = "1.0.0"
+description = "Bode plot measurement tool for Rigol DHO900-series oscilloscopes"
+readme = "README.md"
+authors = [{ name = "Wenzel Jakob" }]
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "matplotlib",
+    "pyvisa",
+    "pyvisa-py",
+]
+
+[project.scripts]
+rigol-bode = "rigol.bode:main"
+rigol = "rigol.bode:main"
+
+[tool.setuptools.packages.find]
+include = ["rigol"]

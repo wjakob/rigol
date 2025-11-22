@@ -7,10 +7,15 @@ appear to contain artifacts and noticeably deviate from expected results. A
 discussion on the EEVBlog forum mentioned that this could be a software bug and
 not a hardware problem.
 
-This simple Python package (to be run on a separate computer) drives the scope
-and arbitrary function generator via SCPI commands, using NumPy to compute
-attenuation+phase shift. It provides results that better match the expected
-behavior when examining simple RC/LC filters (see below for some results).
+This simple Python package (to be run on a separate computer) can drive the
+scope and arbitrary function generator via SCPI commands, using NumPy to
+compute attenuation+phase shift. It provides results that better match the
+expected behavior when examining simple RC/LC filters (see below for some
+results).
+
+Besides Bode plots, this package also provides ``rigol.Scope`` Pythons class
+that provides a convenient abstraction over the scope's state. It implements
+caching and batches updates for improved SCPI communication performance.
 
 Note: I am a computer scientist studying electronics as a hobby. This project
 was vibe-coded in an afternoon. Your mileage may vary.
@@ -72,6 +77,9 @@ cd bode
 
 # Install dependencies
 pip install numpy matplotlib pyvisa pyvisa-py
+
+# Install the package (editable mode for development)
+pip install -e .
 ```
 
 ## Quick Start
@@ -81,7 +89,7 @@ The following are to be executed in the project directory.
 ### Basic measurement with live plotting
 
 ```bash
-python -m bode
+python -m rigol.bode
 ```
 
 This runs a sweep from 1 KHz to 10 MHz with 10V signal amplitude and displays a
@@ -93,19 +101,19 @@ these behaviors.
 ### Measure and save to CSV
 
 ```bash
-python -m bode --dump measurement.csv
+python -m rigol.bode --dump measurement.csv
 ```
 
 ### Custom frequency range and voltage
 
 ```bash
-python -m bode -v 5V --start 100Hz --end 1MHz --steps 50
+python -m rigol.bode -v 5V --start 100Hz --end 1MHz --steps 50
 ```
 
 ### Headless mode (no GUI, shows progress)
 
 ```bash
-python -m bode --headless --dump data.csv
+python -m rigol.bode --headless --dump data.csv
 ```
 
 ## Usage Examples
@@ -116,42 +124,42 @@ Compare measurements against theoretical filter responses:
 
 ```bash
 # Overlay 1st-order RC lowpass at 10 KHz cutoff
-python -m bode --rc-lowpass 10KHz
+python -m rigol.bode --rc-lowpass 10KHz
 
 # Overlay 2nd-order RLC lowpass at 100 KHz with 3.6Ω ESR
-python -m bode --rlc-lowpass 100KHz:3.6
+python -m rigol.bode --rlc-lowpass 100KHz:3.6
 
 # Ideal LC filter (no resistance)
-python -m bode --rlc-lowpass 100KHz
+python -m rigol.bode --rlc-lowpass 100KHz
 
 # Compare against multiple reference curves (RC and RLC)
-python -m bode --rc-lowpass 1KHz --rlc-lowpass 10KHz:3.6 --rc-highpass 100Hz
+python -m rigol.bode --rc-lowpass 1KHz --rlc-lowpass 10KHz:3.6 --rc-highpass 100Hz
 
 # Compare ideal LC vs real RLC with resistance
-python -m bode --rlc-lowpass 10KHz --rlc-lowpass 10KHz:5
+python -m rigol.bode --rlc-lowpass 10KHz --rlc-lowpass 10KHz:5
 
 # LC bandpass filter (parallel LC with voltage divider)
 # Format: L:C:R_ESR:R_SOURCE
 # Example: 1mH inductor, 10nF capacitor, 0.5Ω inductor ESR, 3.3kΩ protection resistor
-python -m bode --lc-bandpass 1mH:10nF:0.5:3.3k
+python -m rigol.bode --lc-bandpass 1mH:10nF:0.5:3.3k
 
 # LC bandstop (notch) filter (series LC shunt to ground)
 # Example: 1mH inductor, 10nF capacitor, 0.5Ω inductor ESR, 4.7kΩ protection resistor
-python -m bode --lc-bandstop 1mH:10nF:0.5:4.7k
+python -m rigol.bode --lc-bandstop 1mH:10nF:0.5:4.7k
 ```
 
 ### Low Voltage Measurements
 
 ```bash
 # For sensitive circuits (e.g., 10mV signal)
-python -m bode -v 10mV --start 1KHz --end 100KHz
+python -m rigol.bode -v 10mV --start 1KHz --end 100KHz
 ```
 
 ### 50Ω Termination
 
 ```bash
 # When 50Ω terminators are physically connected to channels
-python -m bode -v 10V --terminated
+python -m rigol.bode -v 10V --terminated
 ```
 
 The `--terminated` flag compensates for the voltage divider effect of 50Ω terminators.
@@ -160,8 +168,10 @@ The `--terminated` flag compensates for the voltage divider effect of 50Ω termi
 
 ```bash
 # Use CH2 for input, CH4 for output, custom scope IP
-python -m bode -i 2 -o 4 -a 192.168.1.100
+python -m rigol.bode -i 2 -o 4 -a 192.168.1.100
 ```
+
+You can also use the installed entry points `rigol` or `rigol-bode` instead of `python -m rigol.bode`.
 
 ## Command-Line Options
 
@@ -175,6 +185,7 @@ python -m bode -i 2 -o 4 -a 192.168.1.100
 - `-s`, `--start` - Start frequency (e.g., `100Hz`, `1KHz`) (default: `1KHz`)
 - `-e`, `--end` - End frequency (e.g., `100KHz`, `10MHz`) (default: `10MHz`)
 - `--steps` - Number of measurement points (default: `30`)
+- `--steps-per-decade N` - Number of logarithmically spaced points per decade (matches Rigol UI spacing)
 
 ### Output Options
 - `-d`, `--dump` - Save data to CSV file
@@ -195,6 +206,7 @@ python -m bode -i 2 -o 4 -a 192.168.1.100
 - `--cycles` - Target cycles displayed on screen (default: `10`)
 - `--headroom` - Headroom factor above signal (default: `1.2` = 20%)
 - `--terminated` - Account for 50Ω termination in channel voltage computation
+- `--debug {0,1,2}` - Print SCPI commands (1) or commands plus error checks (2)
 
 ## Technical Details
 
