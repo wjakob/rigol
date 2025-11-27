@@ -24,7 +24,7 @@ def scope():
 def clear_cache(scope):
     """Clear scope cache between tests to ensure isolation."""
     # Commit any pending changes before clearing to avoid leaving scope in bad state
-    scope._commit()
+    scope.commit()
     scope.clear_cache()
     yield
 

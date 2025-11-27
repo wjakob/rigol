@@ -218,6 +218,148 @@ You can also use the installed entry points `rigol` or `rigol-bode` instead of `
   scale (improves SNR), reduction by 2x, if signal exceeds headroom threshold
   (prevents clipping).
 
+## Using the Scope Class Directly
+
+Beyond Bode plots, this package provides a `rigol.Scope` class for direct
+oscilloscope control. It offers a property-based API with automatic command
+batching for efficient SCPI communication.
+
+### Basic Usage
+
+```python
+from rigol import Scope
+
+# Connect to scope
+scope = Scope(ip='192.168.5.2', debug_level=0)
+
+# Configure timebase
+scope.tdiv = '1ms'      # 1ms per division
+scope.tmax = '10ms'     # Or set total time on screen (10 divisions)
+scope.toffset = 0
+scope.mem_depth = '10K'
+
+# Configure channel 1
+ch1 = scope.channels[0]
+ch1.enabled = True
+ch1.coupling = 'DC'
+ch1.probe = 10          # 10x probe
+ch1.vdiv = 1.0          # 1V per division
+ch1.vmax = 4.0          # Or set max voltage (4 divisions from center)
+ch1.offset = 0
+
+# Configure trigger
+scope.trigger.mode = 'EDGE'
+scope.trigger.source = ch1  # Can use Channel object or string like 'CHAN1'
+scope.trigger.level = 0.5
+scope.trigger.slope = 'POS'
+
+# Arm single-shot acquisition and wait
+scope.single()
+scope.wait_trigger(timeout=5.0)
+
+# Read waveform data
+waveform = ch1.waveform()
+
+# Or get waveform with sample interval
+waveform, dt = ch1.waveform(dt=True)
+```
+
+### Command Batching
+
+Property changes are queued and sent to the scope in batches for efficiency.
+Commands are automatically flushed before operations that need current settings
+(e.g., `single()`, `run()`, property reads). You can also flush manually:
+
+```python
+scope.tdiv = '1ms'
+scope.channels[0].vdiv = 0.5
+scope.commit()  # Send both changes now
+```
+
+### Arbitrary Function Generator (AFG)
+
+```python
+# Configure built-in function generator
+scope.afg.enabled = True
+scope.afg.function = 'SINusoid'  # SINusoid, SQUare, RAMP, PULSe, DC, NOISe, ARB
+scope.afg.frequency = '1kHz'
+scope.afg.voltage = '2V'         # Peak-to-peak amplitude
+scope.afg.offset = 0
+```
+
+### Adaptive Waveform Capture
+
+The `waveform()` method supports adaptive mode that automatically adjusts
+voltage scale for optimal signal quality:
+
+```python
+scope.single()
+scope.wait_trigger()
+
+# Adaptive capture: auto-adjusts vdiv if signal clips or is too small
+waveform = ch1.waveform(adaptive=True, headroom=1.2)
+```
+
+### SI Unit Support
+
+Properties accept SI unit strings for convenience:
+
+```python
+scope.tdiv = '100us'        # 100 microseconds
+scope.tmax = '1ms'          # 1 millisecond
+ch1.vdiv = '500mV'          # 500 millivolts
+scope.afg.frequency = '10kHz'
+```
+
+### Debug Modes
+
+```python
+# Level 0: No debug output (default)
+scope = Scope(ip='192.168.5.2', debug_level=0)
+
+# Level 1: Print SCPI commands to stderr
+scope = Scope(ip='192.168.5.2', debug_level=1)
+
+# Level 2: Print commands and check for errors after each
+scope = Scope(ip='192.168.5.2', debug_level=2)
+```
+
+### Available Properties
+
+**Scope:**
+- `tdiv`, `tmax`, `toffset` - Timebase settings
+- `tmode` - Timebase mode (`MAIN`, `XY`, `ROLL`)
+- `mem_depth` - Memory depth (`1K`, `10K`, `100K`, `1M`, `10M`, `25M`, `50M`)
+- `acq_type` - Acquisition type (`NORMal`, `PEAK`, `AVERages`, `ULTRa`)
+- `acq_averages` - Number of averages
+
+**Channel:**
+- `enabled` - Channel display on/off
+- `vdiv`, `vmax` - Voltage scale
+- `offset`, `position` - Vertical offset and position
+- `coupling` - Input coupling (`DC`, `AC`, `GND`)
+- `probe` - Probe attenuation factor
+- `bwlimit` - Bandwidth limit (`20M`, `OFF`)
+- `invert` - Invert display
+
+**Trigger:**
+- `mode` - Trigger mode
+- `source` - Trigger source (Channel object or string)
+- `level` - Trigger level voltage
+- `slope` - Trigger slope
+- `sweep` - Trigger sweep mode
+- `nreject` - Noise rejection
+
+**AFG:**
+- `enabled` - Output on/off
+- `function` - Waveform type
+- `frequency` - Output frequency
+- `voltage` - Output amplitude
+- `offset` - DC offset
+- `phase` - Phase offset
+- `duty` - Square wave duty cycle
+- `symmetry` - Ramp symmetry
+
 ## License
 
 This project is licensed under the BSD 3-Clause License.

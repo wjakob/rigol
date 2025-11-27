@@ -109,6 +109,7 @@ class Scope:
 
     All parameter changes are batched and automatically committed when needed
     (e.g., when reading values, arming triggers, or running acquisitions).
+    Call ``commit()`` explicitly to flush pending changes immediately.
 
     Example:
         scope = Scope(ip='192.168.5.2', debug_level=0)
@@ -239,15 +240,27 @@ class Scope:
             # If parsing fails, just print the raw error response
             print(f"  Error response: {error_response}", file=sys.stderr)
 
-    def _commit(self, extra_cmd: Optional[str] = None) -> None:
+    def commit(self, extra_cmd: Optional[str] = None) -> None:
         """
-        Execute all queued parameter changes (internal method).
+        Flush all queued parameter changes to the oscilloscope.
+
+        Parameter changes made via property setters (e.g., ``scope.tdiv = 1e-3``)
+        are batched in an internal queue for efficiency. This method sends all
+        pending changes to the device. It is called automatically before operations
+        that require current settings (e.g., ``single()``, ``run()``, property reads),
+        but can also be called explicitly when immediate execution is needed.
 
         When debug_level >= 2: sends each command sequentially and checks for errors after each.
         Otherwise: batches all commands into a single SCPI command for efficiency.
 
         Args:
-            extra_cmd: Optional SCPI command to append (e.g., 'SINGle')
+            extra_cmd: Optional SCPI command to append (e.g., ':SINGle').
+                      Primarily used internally by methods like ``single()`` and ``run()``.
+
+        Example:
+            scope.tdiv = 1e-3
+            scope.channels[0].vdiv = 0.5
+            scope.commit()  # Send both changes now
         """
         if not self._queue and not extra_cmd:
             return
@@ -305,19 +318,19 @@ class Scope:
 
     def single(self) -> None:
         """Arm single-shot acquisition."""
-        self._commit(':SINGle')
+        self.commit(':SINGle')
 
     def run(self) -> None:
         """Start continuous acquisition."""
-        self._commit(':RUN')
+        self.commit(':RUN')
 
     def stop(self) -> None:
         """Stop acquisition and freeze waveform buffer."""
-        self._commit(':STOP')
+        self.commit(':STOP')
 
     def force(self) -> None:
         """Force trigger event immediately (useful for testing)."""
-        self._commit(':TFORce')
+        self.commit(':TFORce')
 
     def reset(self) -> None:
         """
@@ -369,6 +382,17 @@ class Scope:
         or for testing purposes.
         """
         self._cache.clear()
+
+    @property
+    def tmax(self):
+        """Total time on screen (10 horizontal divisions). Derived from tdiv."""
+        return self.tdiv * 10
+
+    @tmax.setter
+    def tmax(self, value):
+        """Set tdiv based on desired total time span."""
+        self.tdiv = value / 10
+
 
 class Channel:
     """
@@ -558,7 +582,7 @@ class Trigger:
             return self._scope._cache[scpi_cmd][0]
 
         # Not in cache: commit pending changes, query device, and cache the result
-        self._scope._commit()
+        self._scope.commit()
         result = self._scope._query(f':{scpi_cmd}?')
         value = result.strip()
         self._scope._cache[scpi_cmd] = (value, Type.STRING)
@@ -607,7 +631,7 @@ def _generate_properties(cls, params, scpi_cmd_fn):
                     return scope._cache[scpi_cmd][0]  # Return just the value
 
                 # Not in cache: commit pending changes, query device, and cache the result
-                scope._commit()
+                scope.commit()
                 result = scope._query(f":{scpi_cmd}?")
                 parsed = scope._parse_value(result, ptype)
                 scope._cache[scpi_cmd] = (parsed, ptype)
