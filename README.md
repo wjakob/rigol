@@ -67,6 +67,7 @@ was vibe-coded in an afternoon. Your mileage may vary.
 - `matplotlib` - plotting
 - `pyvisa` - VISA communication
 - `pyvisa-py` - Python VISA backend
+- `zeroconf` (optional) - for automatic scope discovery on the network
 
 ## Installation
 
@@ -92,11 +93,11 @@ The following are to be executed in the project directory.
 python -m rigol.bode
 ```
 
-This runs a sweep from 1 KHz to 10 MHz with 10V signal amplitude and displays a
-live Bode plot. The script assumes that the scope is available at the IP
-address ``192.168.5.2``, and that 10X probes measure the input and output at
-channels 1/2. See below for the full set of command line options to change
-these behaviors.
+This runs a sweep from 1 KHz to 10 MHz with 5V peak amplitude and displays a
+live Bode plot. The script auto-discovers the scope on the network (requires
+`zeroconf` package) or uses a default IP address. It assumes 10X probes measure
+the input and output at channels 1/2. See below for the full set of command
+line options to change these behaviors.
 
 ### Measure and save to CSV
 
@@ -104,10 +105,10 @@ these behaviors.
 python -m rigol.bode --dump measurement.csv
 ```
 
-### Custom frequency range and voltage
+### Custom frequency range and amplitude
 
 ```bash
-python -m rigol.bode -v 5V --start 100Hz --end 1MHz --steps 50
+python -m rigol.bode -a 2.5V --start 100Hz --end 1MHz --steps 50
 ```
 
 ### Headless mode (no GUI, shows progress)
@@ -148,18 +149,18 @@ python -m rigol.bode --lc-bandpass 1mH:10nF:0.5:3.3k
 python -m rigol.bode --lc-bandstop 1mH:10nF:0.5:4.7k
 ```
 
-### Low Voltage Measurements
+### Low Amplitude Measurements
 
 ```bash
-# For sensitive circuits (e.g., 10mV signal)
-python -m rigol.bode -v 10mV --start 1KHz --end 100KHz
+# For sensitive circuits (e.g., 10mV peak amplitude)
+python -m rigol.bode -a 10mV --start 1KHz --end 100KHz
 ```
 
 ### 50Ω Termination
 
 ```bash
 # When 50Ω terminators are physically connected to channels
-python -m rigol.bode -v 10V --terminated
+python -m rigol.bode -a 5V --terminated
 ```
 
 The `--terminated` flag compensates for the voltage divider effect of 50Ω terminators.
@@ -168,7 +169,7 @@ The `--terminated` flag compensates for the voltage divider effect of 50Ω termi
 
 ```bash
 # Use CH2 for input, CH4 for output, custom scope IP
-python -m rigol.bode -i 2 -o 4 -a 192.168.1.100
+python -m rigol.bode -i 2 -o 4 -A 192.168.1.100
 ```
 
 You can also use the installed entry points `rigol` or `rigol-bode` instead of `python -m rigol.bode`.
@@ -176,12 +177,12 @@ You can also use the installed entry points `rigol` or `rigol-bode` instead of `
 ## Command-Line Options
 
 ### Connection Options
-- `-a`, `--addr` - Oscilloscope IP address (default: `192.168.5.2`)
+- `-A`, `--addr` - Oscilloscope IP address (auto-discovers if not specified; specifying avoids discovery latency)
 - `-i`, `--input` - Input channel 1-4 (default: `1`)
 - `-o`, `--output` - Output channel 1-4 (default: `2`)
 
 ### Measurement Parameters
-- `-v`, `--voltage` - AFG signal amplitude (e.g., `10mV`, `5V`, `10V`) (default: `10V`)
+- `-a`, `--amplitude` - AFG signal amplitude, peak voltage (e.g., `10mV`, `5V`) (default: `5V`)
 - `-s`, `--start` - Start frequency (e.g., `100Hz`, `1KHz`) (default: `1KHz`)
 - `-e`, `--end` - End frequency (e.g., `100KHz`, `10MHz`) (default: `10MHz`)
 - `--steps` - Number of measurement points (default: `30`)
@@ -229,8 +230,11 @@ batching for efficient SCPI communication.
 ```python
 from rigol import Scope
 
-# Connect to scope
-scope = Scope(ip='192.168.5.2', debug_level=0)
+# Connect to scope (auto-discovers on network if zeroconf is installed)
+scope = Scope()
+
+# Or specify IP address explicitly (avoids auto-discovery latency)
+scope = Scope(ip='192.168.5.2')
 
 # Configure timebase
 scope.tdiv = '1ms'      # 1ms per division
@@ -251,7 +255,7 @@ ch1.offset = 0
 scope.trigger.mode = 'EDGE'
 scope.trigger.source = ch1  # Can use Channel object or string like 'CHAN1'
 scope.trigger.level = 0.5
-scope.trigger.slope = 'POS'
+scope.trigger.slope = 'POSitive'
 
 # Arm single-shot acquisition and wait
 scope.single()
@@ -283,9 +287,36 @@ scope.commit()  # Send both changes now
 scope.afg.enabled = True
 scope.afg.function = 'SINusoid'  # SINusoid, SQUare, RAMP, PULSe, DC, NOISe, ARB
 scope.afg.frequency = '1kHz'
-scope.afg.voltage = '2V'         # Peak-to-peak amplitude
+scope.afg.amplitude = '2V'       # Peak amplitude (not peak-to-peak)
 scope.afg.offset = 0
+
+# Get the voltage range (min, max) at the load
+v_min, v_max = scope.afg.vrange  # (-2.0, 2.0) for 2V amplitude centered at 0
+
+# Or set amplitude and offset by specifying the range (accepts SI strings)
+scope.afg.vrange = (0, 5)        # Sets amplitude=2.5V, offset=2.5V
+scope.afg.vrange = ('-500mV', '500mV')  # Sets amplitude=0.5V, offset=0V
 ```
+
+#### 50Ω Termination Compensation
+
+When using 50Ω terminators on the AFG output, the AFG's 50Ω output impedance
+forms a voltage divider that halves the voltage at the load. The `termination`
+property automatically compensates for this:
+
+```python
+# Set termination BEFORE setting amplitude/offset
+scope.afg.termination = 50       # 50Ω load termination (also accepts '50 Ohm')
+scope.afg.amplitude = '1V'       # Actual amplitude at load will be 1V
+                                 # (AFG internally outputs 2V to compensate)
+
+# For high-impedance loads (no compensation needed)
+scope.afg.termination = float('inf')  # Default - no compensation
+```
+
+The compensation factor is calculated as `(R_source + R_load) / R_load` where
+`R_source` is the AFG's 50Ω output impedance. For a 50Ω load, this means the
+AFG outputs twice the requested voltage to achieve the desired voltage at the load.
 
 ### Adaptive Waveform Capture
 
@@ -315,13 +346,13 @@ scope.afg.frequency = '10kHz'
 
 ```python
 # Level 0: No debug output (default)
-scope = Scope(ip='192.168.5.2', debug_level=0)
+scope = Scope(debug_level=0)
 
 # Level 1: Print SCPI commands to stderr
-scope = Scope(ip='192.168.5.2', debug_level=1)
+scope = Scope(debug_level=1)
 
 # Level 2: Print commands and check for errors after each
-scope = Scope(ip='192.168.5.2', debug_level=2)
+scope = Scope(debug_level=2)
 ```
 
 ### Available Properties
@@ -354,8 +385,10 @@ scope = Scope(ip='192.168.5.2', debug_level=2)
 - `enabled` - Output on/off
 - `function` - Waveform type
 - `frequency` - Output frequency
-- `voltage` - Output amplitude
-- `offset` - DC offset
+- `termination` - Load termination resistance (e.g., 50) for voltage compensation
+- `amplitude` - Output amplitude, peak voltage (compensated for termination)
+- `offset` - DC offset (compensated for termination)
+- `vrange` - Output voltage range (min, max) derived from amplitude and offset
 - `phase` - Phase offset
 - `duty` - Square wave duty cycle
 - `symmetry` - Ramp symmetry

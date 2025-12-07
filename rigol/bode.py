@@ -6,10 +6,9 @@ Supports flexible callbacks for progress reporting and live plotting.
 
 Usage:
     bode = BodePlot(
-        ip='192.168.5.2',
         input_ch=1,
         output_ch=2,
-        afg_voltage=10.0,
+        afg_amplitude=10.0,
         max_voltage=12.0,
         probe_factor=10,
         headroom=1.2,
@@ -56,15 +55,16 @@ class BodePlot:
 
     def __init__(
         self,
-        ip: str = '192.168.5.2',
+        ip: Optional[str] = None,
         input_ch: int = 1,
         output_ch: int = 2,
         desired_cycles: int = 10,
         mem_depth: str = '10K',
         max_voltage: float = 10.0,
         probe_factor: int = 10,
-        afg_voltage: float = 10.0,
+        afg_amplitude: float = 10.0,
         headroom: float = 1.2,
+        terminated: bool = False,
         debug_level: int = 0,
         quiet: bool = False,
     ):
@@ -73,8 +73,8 @@ class BodePlot:
 
         Parameters
         ----------
-        ip : str
-            Oscilloscope IP address
+        ip : str, optional
+            Oscilloscope IP address. If None, auto-discovers on network.
         input_ch : int
             Input channel number (1-4)
         output_ch : int
@@ -87,10 +87,12 @@ class BodePlot:
             Channel voltage range (includes headroom)
         probe_factor : int
             Probe attenuation factor (e.g., 10 for 10x probe)
-        afg_voltage : float
-            AFG output signal amplitude in volts
+        afg_amplitude : float
+            AFG output signal amplitude (peak voltage, not peak-to-peak)
         headroom : float
             Headroom factor for dynamic range (must be >= 1.0)
+        terminated : bool
+            If True, compensate for 50Ω termination on channels
         debug_level : int
             Debug verbosity level (0=off, 1=print commands, 2=print and check errors)
         quiet : bool
@@ -111,10 +113,11 @@ class BodePlot:
         self.input_ch = self.scope.channels[input_ch - 1]
         self.output_ch = self.scope.channels[output_ch - 1]
 
-        # Configure AFG
+        # Configure AFG (set termination first so amplitude is compensated correctly)
+        self.scope.afg.termination = 50.0 if terminated else float('inf')
         self.scope.afg.function = 'SINusoid'
         self.scope.afg.frequency = 1000.0  # Default 1kHz (will be set to actual value during sweep)
-        self.scope.afg.voltage = afg_voltage
+        self.scope.afg.amplitude = afg_amplitude
         self.scope.afg.offset = 0.0
         self.scope.afg.enabled = True
 
@@ -378,18 +381,18 @@ Features automatic dynamic range adjustment.''',
         epilog='''
 Basic Examples:
   %(prog)s
-    Run with all defaults: 10V, 1KHz-10MHz, 30 steps, live plot
+    Run with all defaults: 5V amplitude, 1KHz-10MHz, 30 steps, live plot
 
-  %(prog)s -v 5V -s 100Hz -e 1MHz --steps 50
-    Custom voltage and frequency range with 50 measurement points
+  %(prog)s -a 2.5V -s 100Hz -e 1MHz --steps 50
+    Custom amplitude and frequency range with 50 measurement points
 
-  %(prog)s -v 10mV --start 1KHz --end 100KHz
-    Low voltage measurement (e.g., for sensitive circuits)
+  %(prog)s -a 10mV --start 1KHz --end 100KHz
+    Low amplitude measurement (e.g., for sensitive circuits)
 
   %(prog)s --dump data.csv --headless
     Save to CSV without displaying plots (shows progress)
 
-  %(prog)s -v 2V --terminated
+  %(prog)s -a 2V --terminated
     Use when 50Ω terminators are physically connected to channels (compensates for voltage divider)
 
 Reference Curves:
@@ -402,12 +405,12 @@ Reference Curves:
   %(prog)s --rc-highpass 100Hz --rc-lowpass 10KHz
     Compare measurement against RC highpass and lowpass models
 
-  %(prog)s -v 5V --rlc-lowpass 10KHz --rlc-lowpass 10KHz:5
+  %(prog)s -a 2.5V --rlc-lowpass 10KHz --rlc-lowpass 10KHz:5
     Compare ideal LC (R=0) vs RLC with 5Ω resistance at same frequency
 
 Advanced:
-  %(prog)s -i 2 -o 4 -a 192.168.1.100
-    Use CH2 input, CH4 output, custom oscilloscope IP
+  %(prog)s -i 2 -o 4 -A 192.168.1.100
+    Use CH2 input, CH4 output, specify oscilloscope IP explicitly
 
   %(prog)s --headroom 1.5 --mem-depth 100K
     Increase headroom to 50%% and use 100K sample memory
@@ -416,7 +419,7 @@ Advanced:
     Automated measurement: save CSV, no GUI
 
 Notes:
-  - AFG output voltage is set to the specified voltage
+  - Amplitude is specified as peak voltage (not peak-to-peak)
   - Channel voltage ranges include headroom (default 20%%) to prevent clipping
   - Dynamic range adjustment automatically optimizes output channel scale
   - Use --quiet to suppress all output except errors
@@ -424,16 +427,16 @@ Notes:
     )
 
     # Connection and channel options
-    parser.add_argument('-a', '--addr', default='192.168.5.2',
-                       help='Oscilloscope IP address (default: 192.168.5.2)')
+    parser.add_argument('-A', '--addr', default=None,
+                       help='Oscilloscope IP address (auto-discovers if not specified)')
     parser.add_argument('-i', '--input', type=int, default=1, choices=[1, 2, 3, 4],
                        help='Input channel (default: 1)')
     parser.add_argument('-o', '--output', type=int, default=2, choices=[1, 2, 3, 4],
                        help='Output channel (default: 2)')
 
     # Measurement parameters
-    parser.add_argument('-v', '--voltage', type=str, default='10V',
-                       help='AFG signal amplitude (e.g., 10mV, 5V, 10V). Channel voltage ranges are automatically set to voltage × headroom factor (default: 10V)')
+    parser.add_argument('-a', '--amplitude', type=str, default='5V',
+                       help='AFG signal amplitude (peak voltage, not peak-to-peak), e.g., 10mV, 5V. Channel voltage ranges are automatically set to amplitude × headroom factor (default: 5V)')
     parser.add_argument('-s', '--start', type=str, default='1KHz',
                        help='Start frequency for sweep (e.g., 100Hz, 1KHz, 10KHz) (default: 1KHz)')
     parser.add_argument('-e', '--end', type=str, default='10MHz',
@@ -494,7 +497,7 @@ Notes:
 
     # Parse voltage and frequencies
     try:
-        voltage_v = parse_si(args.voltage, unit='V')
+        voltage_v = parse_si(args.amplitude, unit='V')
         start_hz = parse_si(args.start, unit='Hz')
         end_hz = parse_si(args.end, unit='Hz')
     except ValueError as e:
@@ -630,10 +633,8 @@ Notes:
     # Pass None if no extra plots requested
     extra = extra if extra else None
 
-    afg_voltage = voltage_v
-    peak_voltage = voltage_v / 2.0  # Convert amplitude to peak voltage
-    termination_factor = 0.5 if args.terminated else 1.0
-    input_max_voltage = peak_voltage * termination_factor * args.headroom
+    afg_amplitude = voltage_v
+    input_max_voltage = voltage_v * args.headroom
     mem_depth_str = args.mem_depth
 
     if args.steps_per_decade:
@@ -647,8 +648,8 @@ Notes:
         print(f"Connecting to oscilloscope at {args.addr}...")
         print(f"Measurement range: {start_hz/1e3:.1f} kHz to {end_hz/1e6:.1f} MHz")
         termination_str = " (50Ω terminated)" if args.terminated else ""
-        print(f"Signal voltage: {voltage_v:.3f} V, Headroom: {args.headroom}x{termination_str}")
-        print(f"AFG voltage: {afg_voltage:.3f} V, Channel range: {input_max_voltage:.3f} V")
+        print(f"Signal amplitude: {voltage_v:.3f} V (peak), Headroom: {args.headroom}x{termination_str}")
+        print(f"AFG amplitude: {afg_amplitude:.3f} V, Channel range: ±{input_max_voltage:.3f} V")
         print(f"Channels: Input=CH{args.input}, Output=CH{args.output}")
 
     bode = BodePlot(
@@ -659,8 +660,9 @@ Notes:
         mem_depth=mem_depth_str,
         max_voltage=input_max_voltage,
         probe_factor=args.probe_factor,
-        afg_voltage=afg_voltage,
+        afg_amplitude=afg_amplitude,
         headroom=args.headroom,
+        terminated=args.terminated,
         debug_level=args.debug,
         quiet=args.quiet,
     )

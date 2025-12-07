@@ -10,6 +10,25 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
 
+# Precompiled regex for SI unit parsing
+# Matches: optional sign, number, optional whitespace, optional SI prefix, optional whitespace, optional unit
+_SI_PATTERN = re.compile(r'^(-?[\d.]+)\s*([pnuµmkKMGT]?)\s*([a-zA-Z]+)?$')
+
+# SI prefix multipliers (case-sensitive to distinguish m (milli) from M (mega))
+_SI_MULTIPLIERS = {
+    '': 1,
+    'p': 1e-12,  # pico
+    'n': 1e-9,   # nano
+    'u': 1e-6,   # micro (ASCII)
+    'µ': 1e-6,   # micro (Unicode)
+    'm': 1e-3,   # milli
+    'k': 1e3,    # kilo (lowercase)
+    'K': 1e3,    # kilo (uppercase)
+    'M': 1e6,    # mega
+    'G': 1e9,    # giga
+    'T': 1e12,   # tera
+}
+
 
 def _format_frequency_tick(value, pos):
     """Format frequency tick labels in Hz/KHz/MHz."""
@@ -80,36 +99,19 @@ def parse_si(value: str, unit: str = 'Hz') -> float:
     original_value = value
     value = value.strip()
 
-    # Match number (with optional decimal) followed by optional SI prefix and unit
-    # Case-sensitive for prefix to distinguish m (milli) from M (mega)
-    match = re.match(r'^([\d.]+)\s*([pnuµmkKMGT]?)([a-zA-Z]+)?$', value)
+    match = _SI_PATTERN.match(value)
     if not match:
         raise ValueError(f"Invalid format: {original_value}")
 
     number = float(match.group(1))
-    prefix = match.group(2)  # Keep case-sensitive
-    found_unit = match.group(3) if match.group(3) else None
+    prefix = match.group(2)
+    found_unit = match.group(3)
 
     # Normalize unit comparison (case-insensitive)
     if found_unit and found_unit.upper() != unit.upper():
         raise ValueError(f"Expected unit '{unit}' but found '{found_unit}' in: {original_value}")
 
-    # SI prefix multipliers (case-sensitive)
-    multipliers = {
-        '': 1,
-        'p': 1e-12,  # pico
-        'n': 1e-9,   # nano
-        'u': 1e-6,   # micro (ASCII)
-        'µ': 1e-6,   # micro (Unicode)
-        'm': 1e-3,   # milli
-        'k': 1e3,    # kilo (lowercase)
-        'K': 1e3,    # kilo (uppercase)
-        'M': 1e6,    # mega
-        'G': 1e9,    # giga
-        'T': 1e12,   # tera
-    }
-
-    return number * multipliers.get(prefix, 1)
+    return number * _SI_MULTIPLIERS.get(prefix, 1)
 
 
 def generate_frequencies_per_decade(f_min: float, f_max: float, steps_per_decade: int) -> np.ndarray:

@@ -8,11 +8,12 @@ Properties are automatically generated from parameter tables for efficiency and 
 """
 
 from enum import Enum
-from typing import Optional, Any, Dict, Tuple, overload, Literal
+from typing import Optional, Any, Dict, Tuple, overload, Literal, TYPE_CHECKING
 import numpy as np
 import pyvisa
 import sys
 import time
+import re
 
 from .util import parse_si
 
@@ -27,45 +28,60 @@ class Type(Enum):
     TIME = 6
 
 
-# Parameter table structure: (name, type, scpi_template, valid_values)
+# Parameter table structure: (name, type, scpi_template, valid_values, priority)
+# Priority is used to sort commands before sending. Lower = earlier. None = no reordering.
 SCOPE_PARAMS = [
-    ('tdiv', Type.TIME, 'TIMebase:MAIN:SCALe', None),
-    ('toffset', Type.TIME, 'TIMebase:MAIN:OFFSet', None),
-    ('tmode', Type.STRING, 'TIMebase:MODE', ['MAIN', 'XY', 'ROLL']),
-    ('mem_depth', Type.STRING, 'ACQuire:MDEPth', ['1K', '10K', '100K', '1M', '10M', '25M', '50M']),
-    ('acq_type', Type.STRING, 'ACQuire:TYPE', ['NORMal', 'PEAK', 'AVERages', 'ULTRa']),
-    ('acq_averages', Type.UNITLESS, 'ACQuire:AVERages', None),
+    ('tdiv', Type.TIME, 'TIMebase:MAIN:SCALe', None, None),
+    ('toffset', Type.TIME, 'TIMebase:MAIN:OFFSet', None, None),
+    ('tmode', Type.STRING, 'TIMebase:MODE', ['MAIN', 'XY', 'ROLL'], None),
+    ('mem_depth', Type.STRING, 'ACQuire:MDEPth', ['1K', '10K', '100K', '1M', '10M', '25M', '50M'], None),
+    ('acq_type', Type.STRING, 'ACQuire:TYPE', ['NORMal', 'PEAK', 'AVERages', 'ULTRa'], None),
+    ('acq_averages', Type.UNITLESS, 'ACQuire:AVERages', None, None),
 ]
 
 CHANNEL_PARAMS = [
-    ('vdiv', Type.VOLTAGE, 'CHANnel{ch}:SCALe', None),
-    ('probe', Type.UNITLESS, 'CHANnel{ch}:PROBe', None),
-    ('enabled', Type.BOOLEAN, 'CHANnel{ch}:DISPlay', None),
-    ('coupling', Type.STRING, 'CHANnel{ch}:COUPling', ['DC', 'AC', 'GND']),
-    ('bwlimit', Type.STRING, 'CHANnel{ch}:BWLimit', ['20M', 'OFF']),
-    ('offset', Type.VOLTAGE, 'CHANnel{ch}:OFFSet', None),
-    ('position', Type.VOLTAGE, 'CHANnel{ch}:POSition', None),
-    ('invert', Type.BOOLEAN, 'CHANnel{ch}:INVert', None),
+    # Priority enforces order: enabled -> probe -> vdiv -> offset (each affects the next's valid range)
+    ('enabled', Type.BOOLEAN, 'CHANnel{ch}:DISPlay', None, 0),
+    ('probe', Type.UNITLESS, 'CHANnel{ch}:PROBe', None, 1),
+    ('vdiv', Type.VOLTAGE, 'CHANnel{ch}:SCALe', None, 2),
+    ('offset', Type.VOLTAGE, 'CHANnel{ch}:OFFSet', None, 3),
+    ('position', Type.VOLTAGE, 'CHANnel{ch}:POSition', None, None),
+    ('coupling', Type.STRING, 'CHANnel{ch}:COUPling', ['DC', 'AC', 'GND'], None),
+    ('bwlimit', Type.STRING, 'CHANnel{ch}:BWLimit', ['20M', 'OFF'], None),
+    ('invert', Type.BOOLEAN, 'CHANnel{ch}:INVert', None, None),
 ]
 
 AFG_PARAMS = [
-    ('enabled', Type.BOOLEAN, 'SOURce:OUTPut:STATe', None),
-    ('function', Type.STRING, 'SOURce:FUNCtion', ['SINusoid', 'SQUare', 'RAMP', 'PULSe', 'DC', 'NOISe', 'ARB']),
-    ('voltage', Type.VOLTAGE, 'SOURce:VOLTage:AMPLitude', None),
-    ('frequency', Type.FREQUENCY, 'SOURce:FREQuency', None),
-    ('offset', Type.VOLTAGE, 'SOURce:VOLTage:OFFSet', None),
-    ('phase', Type.UNITLESS, 'SOURce:PHASe', None),
-    ('duty', Type.UNITLESS, 'SOURce:FUNCtion:SQUare:DUTY', None),
-    ('symmetry', Type.UNITLESS, 'SOURce:FUNCtion:RAMP:SYMMetry', None),
+    ('enabled', Type.BOOLEAN, 'SOURce:OUTPut:STATe', None, None),
+    ('function', Type.STRING, 'SOURce:FUNCtion', ['SINusoid', 'SQUare', 'RAMP', 'PULSe', 'DC', 'NOISe', 'ARB'], None),
+    ('_amplitude_raw', Type.VOLTAGE, 'SOURce:VOLTage:AMPLitude', None, None),
+    ('frequency', Type.FREQUENCY, 'SOURce:FREQuency', None, None),
+    ('_offset_raw', Type.VOLTAGE, 'SOURce:VOLTage:OFFSet', None, None),
+    ('phase', Type.UNITLESS, 'SOURce:PHASe', None, None),
+    ('duty', Type.UNITLESS, 'SOURce:FUNCtion:SQUare:DUTY', None, None),
+    ('symmetry', Type.UNITLESS, 'SOURce:FUNCtion:RAMP:SYMMetry', None, None),
 ]
 
 TRIGGER_PARAMS = [
-    ('mode', Type.STRING, 'TRIGger:MODE', None),
-    ('level', Type.VOLTAGE, 'TRIGger:EDGE:LEVel', None),
-    ('slope', Type.STRING, 'TRIGger:EDGE:SLOPe', None),
-    ('sweep', Type.STRING, 'TRIGger:SWEep', None),
-    ('nreject', Type.BOOLEAN, 'TRIGger:NREJect', None),
+    ('mode', Type.STRING, 'TRIGger:MODE', ['EDGE', 'PULSe', 'RUNT', 'WIND', 'NEDG', 'SLOPe', 'VIDeo', 'PATTern', 'DELay', 'TIMeout', 'DURation', 'SHOLd', 'RS232', 'IIC', 'SPI'], None),
+    ('_source_raw', Type.STRING, 'TRIGger:EDGE:SOURce', ['CHAN1', 'CHAN2', 'CHAN3', 'CHAN4', 'AC'], None),
+    ('level', Type.VOLTAGE, 'TRIGger:EDGE:LEVel', None, None),
+    ('slope', Type.STRING, 'TRIGger:EDGE:SLOPe', ['POSitive', 'NEGative', 'EITHer'], None),
+    ('sweep', Type.STRING, 'TRIGger:SWEep', ['AUTO', 'NORMal', 'SINGle'], None),
+    ('nreject', Type.BOOLEAN, 'TRIGger:NREJect', None, None),
 ]
+
+# Build SCPI command -> priority lookup from param tables
+_SCPI_PRIORITY = {}
+for _name, _type, _tmpl, _valid, _prio in (
+    SCOPE_PARAMS + CHANNEL_PARAMS + AFG_PARAMS + TRIGGER_PARAMS
+):
+    if _prio is not None:
+        if '{ch}' in _tmpl:
+            for _ch in range(1, 5):
+                _SCPI_PRIORITY[_tmpl.format(ch=_ch)] = _prio
+        else:
+            _SCPI_PRIORITY[_tmpl] = _prio
 
 
 # Helper function for SI unit parsing - used by property setters
@@ -131,7 +147,7 @@ class Scope:
 
         # Configure AFG
         scope.afg.enabled = True
-        scope.afg.voltage = '10V'
+        scope.afg.amplitude = '5V'
         scope.afg.frequency = '1kHz'
 
         # Arm single-shot trigger (automatically commits all pending changes)
@@ -147,12 +163,56 @@ class Scope:
         waveform = scope.channels[0].waveform(adaptive=True, headroom=1.2)
     """
 
-    def __init__(self, ip: str = '192.168.5.2', debug_level: int = 0):
+    if TYPE_CHECKING:
+        @property
+        def tdiv(self) -> float:
+            """Time per division in seconds (horizontal scale). Accepts SI strings like '1ms'."""
+            ...
+        @tdiv.setter
+        def tdiv(self, value: float | str) -> None: ...
+
+        @property
+        def toffset(self) -> float:
+            """Horizontal time offset in seconds. Accepts SI strings like '100us'."""
+            ...
+        @toffset.setter
+        def toffset(self, value: float | str) -> None: ...
+
+        @property
+        def tmode(self) -> Literal['MAIN', 'XY', 'ROLL']:
+            """Timebase mode: MAIN (normal), XY, or ROLL."""
+            ...
+        @tmode.setter
+        def tmode(self, value: Literal['MAIN', 'XY', 'ROLL']) -> None: ...
+
+        @property
+        def mem_depth(self) -> Literal['1K', '10K', '100K', '1M', '10M', '25M', '50M']:
+            """Acquisition memory depth (number of samples)."""
+            ...
+        @mem_depth.setter
+        def mem_depth(self, value: Literal['1K', '10K', '100K', '1M', '10M', '25M', '50M']) -> None: ...
+
+        @property
+        def acq_type(self) -> Literal['NORMal', 'PEAK', 'AVERages', 'ULTRa']:
+            """Acquisition type: NORMal, PEAK detect, AVERages, or ULTRa."""
+            ...
+        @acq_type.setter
+        def acq_type(self, value: Literal['NORMal', 'PEAK', 'AVERages', 'ULTRa']) -> None: ...
+
+        @property
+        def acq_averages(self) -> int:
+            """Number of acquisitions to average (when acq_type is AVERages)."""
+            ...
+        @acq_averages.setter
+        def acq_averages(self, value: int) -> None: ...
+
+    def __init__(self, ip: Optional[str] = None, debug_level: int = 0):
         """
         Initialize scope connection.
 
         Args:
-            ip: IP address of the oscilloscope
+            ip: IP address of the oscilloscope. If None, auto-discovers the first
+                available scope on the network (requires 'zeroconf' package).
             debug_level: Debug verbosity level:
                 0 = no debug output
                 1 = print SCPI commands to stderr
@@ -165,9 +225,42 @@ class Scope:
         self._cache: Dict[str, Tuple[Any, Type]] = {}
 
         # Connect to scope
-        resource = f"TCPIP0::{ip}::INSTR"
         rm = pyvisa.ResourceManager()
+        if ip is None:
+            # Auto-discover scope on network
+            try:
+                resources = rm.list_resources()
+            except Exception:
+                resources = ()
+            tcpip_resources = [r for r in resources if r.startswith('TCPIP')]
+            if not tcpip_resources:
+                raise RuntimeError(
+                    "No oscilloscope found on network. "
+                    "For auto-discovery, install the 'zeroconf' package: pip install zeroconf. "
+                    "Alternatively, specify the IP address explicitly: Scope(ip='192.168.x.x')"
+                )
+
+            discovered = tcpip_resources[0]
+            if self.debug_level >= 1:
+                print(f"< Auto-discovered: {discovered}", file=sys.stderr)
+
+            # Extract host from something like TCPIP0::192.168.0.188::INSTR
+            import re
+            m = re.match(r"TCPIP\d*::([^:]+)::", discovered)
+            if not m:
+                raise RuntimeError(f"Unexpected VISA resource format: {discovered}")
+            host = m.group(1)
+            resource = f"TCPIP0::{host}::5555::SOCKET"
+            if self.debug_level >= 1:
+                print(f"< Using VISA resource: {resource}", file=sys.stderr)
+        else:
+            resource = f"TCPIP0::{ip}::INSTR"
+            resource = f"TCPIP0::{ip}::5555::SOCKET"
+
+        # Set up line endings for SOCKET communication
         self.inst = rm.open_resource(resource)
+        self.inst.read_termination = "\n"
+        self.inst.write_termination = "\n"
         self.inst.timeout = 120_000
 
         # Clear any existing errors in the queue before we start
@@ -265,9 +358,13 @@ class Scope:
         if not self._queue and not extra_cmd:
             return
 
+        # Sort queue by priority (for channels: enabled -> probe -> scale -> offset)
+        # Stable sort preserves insertion order for commands with equal priority (99)
+        sorted_items = sorted(self._queue.items(), key=lambda x: _SCPI_PRIORITY.get(x[0], 99))
+
         if self.debug_level >= 2:
             # Debug mode: send commands one-by-one to catch errors
-            for scpi_cmd, (value, ptype) in self._queue.items():
+            for scpi_cmd, (value, ptype) in sorted_items:
                 value_str = ('ON' if value else 'OFF') if ptype == Type.BOOLEAN else str(value)
                 cmd = f":{scpi_cmd} {value_str}"
                 self._write(cmd)
@@ -277,7 +374,7 @@ class Scope:
         else:
             # Normal mode: batch commands for efficiency
             batched_cmd = ''
-            for scpi_cmd, (value, ptype) in self._queue.items():
+            for scpi_cmd, (value, ptype) in sorted_items:
                 value_str = ('ON' if value else 'OFF') if ptype == Type.BOOLEAN else str(value)
                 batched_cmd += f';:{scpi_cmd} {value_str}'
                 self._cache.pop(scpi_cmd, None)
@@ -345,6 +442,8 @@ class Scope:
         # Don't check errors after *RST because scope is resetting
         self._write('*RST', check_errors=False)
         self._query('*OPC?')
+        # Additional delay - some subsystems may not be fully ready even after *OPC?
+        time.sleep(0.5)
         self._queue.clear()
         self._cache.clear()
 
@@ -384,13 +483,13 @@ class Scope:
         self._cache.clear()
 
     @property
-    def tmax(self):
-        """Total time on screen (10 horizontal divisions). Derived from tdiv."""
+    def tmax(self) -> float:
+        """Total time on screen (10 horizontal divisions). Accepts SI strings like '100ms'."""
         return self.tdiv * 10
 
     @tmax.setter
-    def tmax(self, value):
-        """Set tdiv based on desired total time span."""
+    def tmax(self, value: float | str) -> None:
+        value = _normalize_value(value, Type.TIME)
         self.tdiv = value / 10
 
 
@@ -404,6 +503,63 @@ class Channel:
     Properties are automatically generated from CHANNEL_PARAMS table.
     """
 
+    if TYPE_CHECKING:
+        @property
+        def vdiv(self) -> float:
+            """Volts per division (vertical scale). Accepts SI strings like '100mV'."""
+            ...
+        @vdiv.setter
+        def vdiv(self, value: float | str) -> None: ...
+
+        @property
+        def probe(self) -> int:
+            """Probe attenuation ratio (1, 10, 100, etc.)."""
+            ...
+        @probe.setter
+        def probe(self, value: int) -> None: ...
+
+        @property
+        def enabled(self) -> bool:
+            """Whether the channel is displayed."""
+            ...
+        @enabled.setter
+        def enabled(self, value: bool) -> None: ...
+
+        @property
+        def coupling(self) -> Literal['DC', 'AC', 'GND']:
+            """Input coupling mode: DC, AC, or GND."""
+            ...
+        @coupling.setter
+        def coupling(self, value: Literal['DC', 'AC', 'GND']) -> None: ...
+
+        @property
+        def bwlimit(self) -> Literal['20M', 'OFF']:
+            """Bandwidth limit: 20M (20 MHz filter) or OFF."""
+            ...
+        @bwlimit.setter
+        def bwlimit(self, value: Literal['20M', 'OFF']) -> None: ...
+
+        @property
+        def offset(self) -> float:
+            """Vertical offset in volts. Accepts SI strings like '500mV'."""
+            ...
+        @offset.setter
+        def offset(self, value: float | str) -> None: ...
+
+        @property
+        def position(self) -> float:
+            """Vertical position (bias voltage) in volts. Accepts SI strings like '500mV'."""
+            ...
+        @position.setter
+        def position(self, value: float | str) -> None: ...
+
+        @property
+        def invert(self) -> bool:
+            """Whether the channel display is inverted."""
+            ...
+        @invert.setter
+        def invert(self, value: bool) -> None: ...
+
     def __init__(self, scope: Scope, ch_num: int):
         """
         Initialize channel.
@@ -415,15 +571,14 @@ class Channel:
         self._scope = scope
         self._ch_num = ch_num
 
-    # Special property with custom logic
     @property
-    def vmax(self):
-        """Maximum voltage (full scale = 4 divisions). Derived from vdiv."""
+    def vmax(self) -> float:
+        """Maximum voltage (full scale = 4 divisions). Accepts SI strings like '500mV'."""
         return self.vdiv * 4
 
     @vmax.setter
-    def vmax(self, value):
-        """Set vdiv based on desired maximum voltage."""
+    def vmax(self, value: float | str) -> None:
+        value = _normalize_value(value, Type.VOLTAGE)
         self.vdiv = value / 4
 
     @overload
@@ -543,6 +698,77 @@ class AFG:
     Properties are automatically generated from AFG_PARAMS table.
     """
 
+    if TYPE_CHECKING:
+        @property
+        def enabled(self) -> bool:
+            """Whether the AFG output is enabled."""
+            ...
+        @enabled.setter
+        def enabled(self, value: bool) -> None: ...
+
+        @property
+        def function(self) -> Literal['SINusoid', 'SQUare', 'RAMP', 'PULSe', 'DC', 'NOISe', 'ARB']:
+            """Waveform function type."""
+            ...
+        @function.setter
+        def function(self, value: Literal['SINusoid', 'SQUare', 'RAMP', 'PULSe', 'DC', 'NOISe', 'ARB']) -> None: ...
+
+        @property
+        def termination(self) -> float:
+            """Load termination resistance (default: inf). Compensates voltage/offset for voltage divider."""
+            ...
+        @termination.setter
+        def termination(self, value: float) -> None: ...
+
+        @property
+        def amplitude(self) -> float:
+            """Output amplitude (peak, not peak-to-peak). Accepts SI strings like '1V'. Set termination first."""
+            ...
+        @amplitude.setter
+        def amplitude(self, value: float | str) -> None: ...
+
+        @property
+        def frequency(self) -> float:
+            """Output frequency in Hz. Accepts SI strings like '1kHz'."""
+            ...
+        @frequency.setter
+        def frequency(self, value: float | str) -> None: ...
+
+        @property
+        def offset(self) -> float:
+            """DC offset at the load. Accepts SI strings like '500mV'. Set termination first."""
+            ...
+        @offset.setter
+        def offset(self, value: float | str) -> None: ...
+
+        @property
+        def vrange(self) -> Tuple[float, float]:
+            """Output voltage range (min, max) at the load. Settable with (V_min, V_max) tuple. Accepts SI strings."""
+            ...
+        @vrange.setter
+        def vrange(self, value: Tuple[float | str, float | str]) -> None: ...
+
+        @property
+        def phase(self) -> float:
+            """Phase offset in degrees (0-360)."""
+            ...
+        @phase.setter
+        def phase(self, value: float) -> None: ...
+
+        @property
+        def duty(self) -> float:
+            """Duty cycle for square wave (0-100%)."""
+            ...
+        @duty.setter
+        def duty(self, value: float) -> None: ...
+
+        @property
+        def symmetry(self) -> float:
+            """Symmetry for ramp wave (0-100%)."""
+            ...
+        @symmetry.setter
+        def symmetry(self, value: float) -> None: ...
+
     def __init__(self, scope: Scope):
         """
         Initialize AFG.
@@ -551,6 +777,81 @@ class AFG:
             scope: Parent Scope instance
         """
         self._scope = scope
+        self._termination: float = float('inf')
+
+    @property
+    def termination(self) -> float:
+        """
+        Load termination resistance in Ohms (default: inf for high-impedance).
+
+        When set, amplitude and offset values are automatically scaled to compensate
+        for the voltage divider formed by the AFG's 50Ω output impedance and the
+        load termination. Set this property BEFORE setting amplitude or offset.
+
+        Common values: 50 (for 50Ω termination), inf (high-impedance, no compensation).
+        """
+        return self._termination
+
+    @termination.setter
+    def termination(self, value: float | str) -> None:
+        if isinstance(value, str):
+            # Parse SI strings like '50 Ohm', '50Ω', or just '50'
+            value = parse_si(value, unit='Ohm')
+        self._termination = value
+
+    def _compensation_factor(self) -> float:
+        """Return the voltage compensation factor based on termination."""
+        # Voltage divider: V_load = V_source * R_load / (R_source + R_load)
+        # For high-impedance (inf), no compensation needed (factor = 1.0)
+        if self._termination == float('inf'):
+            return 1.0
+        return (50.0 + self._termination) / self._termination
+
+    @property
+    def amplitude(self) -> float:
+        """
+        Output amplitude (peak voltage, not peak-to-peak). Accepts SI strings like '1V'.
+
+        The device internally uses Vpp, so this property converts automatically.
+        If termination is set, returns the actual amplitude at the load (compensated).
+        """
+        # Device stores Vpp, convert to peak amplitude
+        return self._amplitude_raw / self._compensation_factor() / 2
+
+    @amplitude.setter
+    def amplitude(self, value: float | str) -> None:
+        # Convert peak amplitude to Vpp for device
+        self._amplitude_raw = _normalize_value(value, Type.VOLTAGE) * 2 * self._compensation_factor()
+
+    @property
+    def offset(self) -> float:
+        """
+        DC offset in volts. Accepts SI strings like '500mV'.
+
+        If termination is set, returns the actual offset at the load (compensated).
+        The AFG is commanded with a higher offset to account for the voltage divider.
+        """
+        return self._offset_raw / self._compensation_factor()
+
+    @offset.setter
+    def offset(self, value: float | str) -> None:
+        self._offset_raw = _normalize_value(value, Type.VOLTAGE) * self._compensation_factor()
+
+    @property
+    def vrange(self) -> Tuple[float, float]:
+        """
+        Output voltage range (min, max) at the load.
+
+        Can be set with a tuple (V_min, V_max) which computes amplitude and offset automatically.
+        """
+        return (self.offset - self.amplitude, self.offset + self.amplitude)
+
+    @vrange.setter
+    def vrange(self, value: Tuple[float | str, float | str]) -> None:
+        v_min = _normalize_value(value[0], Type.VOLTAGE)
+        v_max = _normalize_value(value[1], Type.VOLTAGE)
+        self.amplitude = (v_max - v_min) / 2
+        self.offset = (v_max + v_min) / 2
 
 
 class Trigger:
@@ -563,6 +864,49 @@ class Trigger:
     Properties are automatically generated from TRIGGER_PARAMS table.
     """
 
+    if TYPE_CHECKING:
+        @property
+        def mode(self) -> Literal['EDGE', 'PULSe', 'RUNT', 'WIND', 'NEDG', 'SLOPe', 'VIDeo', 'PATTern', 'DELay', 'TIMeout', 'DURation', 'SHOLd', 'RS232', 'IIC', 'SPI']:
+            """Trigger mode."""
+            ...
+        @mode.setter
+        def mode(self, value: Literal['EDGE', 'PULSe', 'RUNT', 'WIND', 'NEDG', 'SLOPe', 'VIDeo', 'PATTern', 'DELay', 'TIMeout', 'DURation', 'SHOLd', 'RS232', 'IIC', 'SPI']) -> None: ...
+
+        @property
+        def source(self) -> str:
+            """Trigger source. Accepts Channel object, channel number (1-4), or string like 'CHAN1'."""
+            ...
+        @source.setter
+        def source(self, value: Channel | int | str) -> None: ...
+
+        @property
+        def level(self) -> float:
+            """Trigger level in volts. Accepts SI strings like '500mV'."""
+            ...
+        @level.setter
+        def level(self, value: float | str) -> None: ...
+
+        @property
+        def slope(self) -> Literal['POSitive', 'NEGative', 'EITHer']:
+            """Trigger slope: POSitive, NEGative, or EITHer."""
+            ...
+        @slope.setter
+        def slope(self, value: Literal['POSitive', 'NEGative', 'EITHer']) -> None: ...
+
+        @property
+        def sweep(self) -> Literal['AUTO', 'NORMal', 'SINGle']:
+            """Trigger sweep mode: AUTO, NORMal, or SINGle."""
+            ...
+        @sweep.setter
+        def sweep(self, value: Literal['AUTO', 'NORMal', 'SINGle']) -> None: ...
+
+        @property
+        def nreject(self) -> bool:
+            """Noise rejection filter enabled."""
+            ...
+        @nreject.setter
+        def nreject(self, value: bool) -> None: ...
+
     def __init__(self, scope: Scope):
         """
         Initialize Trigger.
@@ -573,41 +917,21 @@ class Trigger:
         self._scope = scope
 
     @property
-    def source(self):
-        """Get trigger source (e.g., 'CHAN1', 'EXT')."""
-        scpi_cmd = 'TRIGger:EDGE:SOURce'
+    def source(self) -> str:
+        """
+        Trigger source (e.g., 'CHAN1', 'EXT').
 
-        # Check cache first (committed values)
-        if scpi_cmd in self._scope._cache:
-            return self._scope._cache[scpi_cmd][0]
-
-        # Not in cache: commit pending changes, query device, and cache the result
-        self._scope.commit()
-        result = self._scope._query(f':{scpi_cmd}?')
-        value = result.strip()
-        self._scope._cache[scpi_cmd] = (value, Type.STRING)
-        return value
+        Can be set with a Channel object, channel number (1-4), or string.
+        """
+        return self._source_raw
 
     @source.setter
-    def source(self, value):
-        """
-        Set trigger source.
-
-        Args:
-            value: Can be a Channel object (e.g., scope.channels[0]) or a string (e.g., 'CHAN1', 'EXT')
-        """
-        # Import here to avoid circular dependency
+    def source(self, value: Channel | int | str) -> None:
         if isinstance(value, Channel):
-            # Convert Channel object to SCPI string
             value = f'CHAN{value._ch_num + 1}'
-
-        scpi_cmd = 'TRIGger:EDGE:SOURce'
-
-        # Clear cache entry (will be re-populated on next read)
-        if scpi_cmd in self._scope._cache:
-            del self._scope._cache[scpi_cmd]
-
-        self._scope._queue[scpi_cmd] = (value, Type.STRING)
+        elif isinstance(value, int):
+            value = f'CHAN{value}'
+        self._source_raw = value
 
 
 # Unified property generator - eliminates duplication
@@ -620,7 +944,7 @@ def _generate_properties(cls, params, scpi_cmd_fn):
         params: Parameter table (list of tuples)
         scpi_cmd_fn: Function to generate SCPI command from template and instance
     """
-    for name, ptype, scpi_template, valid_values in params:
+    for name, ptype, scpi_template, valid_values, _priority in params:
         def make_getter(name, ptype, scpi_template):
             def getter(self):
                 scope = self if isinstance(self, Scope) else self._scope

@@ -336,21 +336,21 @@ class TestAFGParameters:
         # Scope may return abbreviated form 'SIN' or full 'SINUSOID'
         assert result.upper() in ['SIN', 'SINUSOID']
 
-    def test_voltage(self, scope):
-        """Test AFG voltage amplitude."""
+    def test_amplitude(self, scope):
+        """Test AFG amplitude (peak voltage, not Vpp). Max is 5V peak (10 Vpp)."""
         afg = scope.afg
-        test_values = [1.0, 5.0, 10.0]
+        test_values = [0.5, 1.0, 5.0]  # Max 5V peak (device caps at 10 Vpp)
 
         for value in test_values:
-            afg.voltage = value
-            result = afg.voltage
+            afg.amplitude = value
+            result = afg.amplitude
             assert abs(result - value) < 1e-3, f"Expected {value}, got {result}"
 
-    def test_voltage_string(self, scope):
-        """Test setting AFG voltage with SI string."""
+    def test_amplitude_string(self, scope):
+        """Test setting AFG amplitude with SI string."""
         afg = scope.afg
-        afg.voltage = '5V'
-        result = afg.voltage
+        afg.amplitude = '5V'
+        result = afg.amplitude
         assert abs(result - 5.0) < 1e-3
 
     def test_frequency(self, scope):
@@ -373,6 +373,8 @@ class TestAFGParameters:
     def test_offset(self, scope):
         """Test AFG DC offset."""
         afg = scope.afg
+        # Set amplitude low enough to allow offset range (amplitude + |offset| <= 5V)
+        afg.amplitude = 1.0
         test_values = [-1.0, 0.0, 1.0]
 
         for value in test_values:
@@ -531,7 +533,7 @@ class TestWaveformAcquisition:
         scope.afg.enabled = True
         scope.afg.function = 'SINusoid'
         scope.afg.frequency = 1000.0
-        scope.afg.voltage = 2.0
+        scope.afg.amplitude = 2.0
 
         # Configure channel
         ch = scope.channels[0]
@@ -680,7 +682,7 @@ class TestAdaptiveCapture:
         scope.afg.enabled = True
         scope.afg.function = 'SINusoid'
         scope.afg.frequency = 1000.0
-        scope.afg.voltage = 2.0
+        scope.afg.amplitude = 2.0
 
         # Configure channel with large initial scale
         ch = scope.channels[0]
