@@ -14,7 +14,7 @@ from rigol.scope import Scope
 def scope():
     """Create scope instance for testing. Connects to default IP."""
     try:
-        s = Scope(ip='192.168.5.2', debug_level=0)
+        s = Scope(debug_level=0)
         yield s
     except Exception as e:
         pytest.skip(f"Scope not available: {e}")

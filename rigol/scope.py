@@ -101,24 +101,6 @@ def _normalize_value(value: Any, ptype: Type) -> Any:
             return value
 
 
-def _parse_tmc_block(raw: bytes) -> bytes:
-    """
-    Parse a SCPI definite-length block (#<digits><len><data>...).
-
-    Returns the data payload (excluding the header). Raises ValueError if the
-    block is malformed.
-    """
-    if not raw or raw[0:1] != b"#":
-        raise ValueError(f"Expected SCPI block starting with '#', got: {raw[:10]!r}")
-
-    n_digits = int(raw[1:2].decode("ascii"))
-    length_str = raw[2:2 + n_digits].decode("ascii")
-    length = int(length_str)
-    start = 2 + n_digits
-    end = start + length
-    return raw[start:end]
-
-
 class Scope:
     """
     Generic SCPI-controlled oscilloscope interface.
@@ -675,12 +657,14 @@ class Channel:
         xincr = preamble[4]  # Sample interval (dt)
         yincr, yorig, yref = preamble[7:10]
 
-        # Read raw block and parse manually, potentially repeat until we get a usable result
-        while True:
-            self._scope._write(f":WAVeform:DATA?")
-            data_bytes = _parse_tmc_block(self._scope.inst.read_raw())
-            if len(data_bytes) != 0:
-                break
+        # Read definite-length block: #<n><length><data><newline>
+        # Parse header to determine exact byte count, avoiding buffer desync
+        self._scope._write(f":WAVeform:DATA?")
+        header = self._scope.inst.read_bytes(2)  # "#" + digit count
+        n_digits = int(chr(header[1]))
+        length = int(self._scope.inst.read_bytes(n_digits))
+        data_bytes = self._scope.inst.read_bytes(length)
+        self._scope.inst.read_bytes(1)  # consume trailing newline
 
         data_array = np.frombuffer(data_bytes, dtype="<u2").astype(np.float64)
         voltage_array = (data_array - (yref - yorig)) * yincr
